@@ -14,16 +14,17 @@ services:
 
   open_notebook:
     image: lfnovo/open_notebook:v1-latest
-    ports:
-      - "8502:8502"  # Web UI
-      - "5055:5055"  # REST API
+    # Use host networking so ON can reach llama-server on localhost
+    # This is required for the 35B teacher model to be accessible via
+    # ON's Transformation API. Remove ports: section when using network_mode.
+    network_mode: host
     environment:
       # REQUIRED: Change this to your own secret string
       # This encrypts your API keys in the database
       - OPEN_NOTEBOOK_ENCRYPTION_KEY=change-me-to-a-secret-string
 
-      # Database connection (default values - no need to change)
-      - SURREAL_URL=ws://surrealdb:8000/rpc
+      # Database connection via localhost (required with network_mode: host)
+      - SURREAL_URL=ws://localhost:8000/rpc
       - SURREAL_USER=root
       - SURREAL_PASSWORD=root
       - SURREAL_NAMESPACE=open_notebook

@@ -1,0 +1,117 @@
+# Open Notebook Librarian Pipeline
+#
+# Prerequisites:
+#   - Nix with flakes enabled, OR: Python 3.10+ with requests, fastapi, uvicorn
+#   - Docker Compose (for Open Notebook)
+#   - llama-server (for 35B/9B models)
+#
+# Quick start:
+#   just bootstrap          # Set up ON transforms, models, credentials
+#   just status             # Check everything is running
+#   just pipeline-fast .    # Run heuristic-only indexing (fast)
+#   just pipeline-full .   # Run full 3-pass indexing with 35B teacher
+#
+# Use Nix:
+#   nix develop             # Enter dev shell with all deps
+#   nix run .#pipeline -- /path/to/repo --mode fast
+#   nix run .#bootstrap     # Bootstrap ON
+
+# ─── Configuration ──────────────────────────────────────────────
+
+ON_URL       := "http://localhost:5055/api"
+LIBRARIAN    := "http://localhost:8081"
+PIPELINE_DIR := "/home/nos/labware/open-notebook/scripts/pipeline"
+
+# ─── Service Management ────────────────────────────────────────
+
+on-up:
+    docker compose -f /home/nos/labware/open-notebook/docker-compose.yml up -d
+
+on-down:
+    docker compose -f /home/nos/labware/open-notebook/docker-compose.yml down
+
+on-logs:
+    docker compose -f /home/nos/labware/open-notebook/docker-compose.yml logs -f open_notebook
+
+# ─── Librarian Server ─────────────────────────────────────────
+
+librarian-start:
+    @echo "Starting librarian server on :8081..."
+    python3 {{PIPELINE_DIR}}/librarian_server.py &
+
+librarian-stop:
+    @pkill -f "librarian_server.py" 2>/dev/null || true
+
+librarian-reload:
+    curl -s -X POST {{LIBRARIAN}}/reload | python3 -m json.tool
+
+librarian-modules:
+    curl -s {{LIBRARIAN}}/modules | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'{len(d)} modules'); [print(f'  {m[\"module\"]} ({m[\"layer\"]})') for m in d[:10]]"
+
+# ─── Bootstrap ────────────────────────────────────────────────
+
+bootstrap:
+    python3 {{PIPELINE_DIR}}/bootstrap_on.py
+
+status:
+    python3 {{PIPELINE_DIR}}/bootstrap_on.py --check
+
+reset-models:
+    python3 {{PIPELINE_DIR}}/bootstrap_on.py --reset-models
+
+# ─── Pipeline ─────────────────────────────────────────────────
+
+pipeline-fast repo:
+    python3 {{PIPELINE_DIR}}/generate_phonebook.py {{repo}} --mode fast
+
+pipeline-incremental repo:
+    python3 {{PIPELINE_DIR}}/generate_phonebook.py {{repo}} --mode incremental
+
+pipeline-full repo:
+    python3 {{PIPELINE_DIR}}/generate_phonebook.py {{repo}} --mode full
+
+# ─── Llama Server ─────────────────────────────────────────────
+
+llama-35b:
+    @echo "Starting 35B teacher model on :8080..."
+    /home/nos/labware/llocollama/llama-server-turboquant \
+        --model /run/media/nos/games/models/Qwen_Qwen3.6-35B-A3B-Q5_K_M.gguf \
+        --flash-attn on --jinja \
+        --chat-template-kwargs '{"preserve_thinking":true}' \
+        --ctx-size 65536 --cache-type-k turbo4 --cache-type-v turbo3 \
+        --parallel 2 --host 0.0.0.0 --port 8080
+
+llama-9b:
+    @echo "Starting 9B student model on :11434..."
+    /home/nos/labware/llocollama/llama-server-turboquant \
+        --model /run/media/nos/games/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf \
+        --flash-attn on --jinja \
+        --chat-template-kwargs '{"preserve_thinking":true}' \
+        --ctx-size 65536 --cache-type-k q4_0 --cache-type-v q4_0 \
+        --cram 8192 \
+        --slot-save-path /var/cache/llama/slots \
+        --system-prompt-file /home/nos/labware/open-notebook/scripts/pipeline/PHONEBOOK_SYSTEM_PROMPT.md \
+        --parallel 2 --host 0.0.0.0 --port 11434
+
+# ─── MCP Bridge ───────────────────────────────────────────────
+
+mcp-test:
+    @echo 'Testing MCP bridge...'
+    @printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' \
+    | python3 {{PIPELINE_DIR}}/mcp_librarian_server.py 2>/dev/null \
+    | python3 -c "import json,sys; lines=[l.strip() for l in sys.stdin if l.strip()]; [print(t['name']) for line in lines for t in json.loads(line).get('result',{}).get('tools',[])]"
+
+# ─── Full Stack ──────────────────────────────────────────────
+
+up: on-up
+    @echo "Open Notebook is up. Run 'just librarian-start' to start the index server."
+
+down: librarian-stop on-down
+    @echo "All services stopped."
+
+full-index repo: bootstrap
+    @echo "Starting full indexing pipeline..."
+    just librarian-start
+    just pipeline-full {{repo}}
+    just librarian-reload
+    @echo "Full indexing complete. Run 'just status' to verify."
