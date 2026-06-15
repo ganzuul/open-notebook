@@ -93,6 +93,20 @@ llama-9b:
         --system-prompt-file /home/nos/labware/open-notebook/scripts/pipeline/PHONEBOOK_SYSTEM_PROMPT.md \
         --parallel 2 --host 0.0.0.0 --port 11434
 
+# ─── Embedding Server ──────────────────────────────────────────
+
+embedding-start:
+    @echo "Starting bge-m3 embedding server on :8082..."
+    nohup python3 {{PIPELINE_DIR}}/embedding_server.py --model BAAI/bge-m3 --port 8082 --device cpu > /tmp/embedding_server.log 2>&1 &
+    @echo "PID: $!"
+
+embedding-stop:
+    @pkill -f "embedding_server.py" 2>/dev/null || true
+
+embedding-test:
+    @curl -s http://localhost:8082/health | python3 -m json.tool
+    @curl -s -X POST http://localhost:8082/v1/embeddings -H "Content-Type: application/json" -d '{"input": "AMM swap invariant", "model": "bge-m3"}' | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'Dim: {len(d[\"data\"][0][\"embedding\"])}, Model: {d[\"model\"]}')"
+
 # ─── MCP Bridge ───────────────────────────────────────────────
 
 mcp-test:
@@ -104,14 +118,15 @@ mcp-test:
 # ─── Full Stack ──────────────────────────────────────────────
 
 up: on-up
-    @echo "Open Notebook is up. Run 'just librarian-start' to start the index server."
+    @echo "Open Notebook is up. Run 'just librarian-start' and 'just embedding-start' to start index servers."
 
-down: librarian-stop on-down
+down: librarian-stop embedding-stop on-down
     @echo "All services stopped."
 
 full-index repo: bootstrap
     @echo "Starting full indexing pipeline..."
     just librarian-start
+    just embedding-start
     just pipeline-full {{repo}}
     just librarian-reload
     @echo "Full indexing complete. Run 'just status' to verify."

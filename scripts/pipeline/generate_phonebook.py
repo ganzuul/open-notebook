@@ -95,8 +95,8 @@ class ONClient:
         r.raise_for_status()
         return r.json()
 
-    def post(self, path: str, data: dict | None = None, **kwargs) -> Any:
-        r = self.session.post(self._url(path), json=data, timeout=120, **kwargs)
+    def post(self, path: str, data: dict | None = None, timeout: int = 120, **kwargs) -> Any:
+        r = self.session.post(self._url(path), json=data, timeout=timeout, **kwargs)
         r.raise_for_status()
         return r.json()
 
@@ -174,6 +174,7 @@ class ONClient:
                 "input_text": input_text,
                 "model_id": model_id,
             },
+            timeout=600,
         )
 
     def models_list(self) -> list:
@@ -420,6 +421,8 @@ def run_pipeline(
     if output_dir is None:
         output_dir = root
 
+    pipeline_start = time.time()
+
     print(f"[1/7] Connecting to Open Notebook at {ON_URL}...")
     nb = on.create_or_get_notebook(notebook_name, description=f"Semantic index for {notebook_name}")
     nb_id = nb["id"]
@@ -504,16 +507,19 @@ def run_pipeline(
     # --- Pass 2: LLM transformation (only in full mode) ---
     enriched_entries = {}
     if mode == "full" and model_id and changed_files and pass2:
+        pass2_start = time.time()
         print(f"[6/7] Pass 2 (Reduce): Running Context-Compiler-V1 on {len(changed_files)} files...")
         transformed = 0
         for i, (fpath, content, analysis) in enumerate(changed_files):
-            print(f"  Transforming {analysis['module']} ({i+1}/{len(changed_files)})...")
+            t0 = time.time()
+            print(f"  Transforming {analysis['module']} ({i+1}/{len(changed_files)})...", end="", flush=True)
             try:
                 result = on.transformation_execute(
                     transformation_id=TRANSFORMATION_CONTEXT_COMPILER,
                     input_text=content,
                     model_id=model_id,
                 )
+                elapsed = time.time() - t0
                 enriched_content = result.get("output", "")
                 if enriched_content:
                     note_title = f"{analysis['module']} — Deep Analysis"
@@ -528,10 +534,15 @@ def run_pipeline(
                         pass
                     enriched_entries[analysis["module"]] = enriched_content
                     transformed += 1
+                    print(f" {elapsed:.1f}s ({len(enriched_content)} chars)")
+                else:
+                    print(f" {elapsed:.1f}s (empty output)")
             except Exception as e:
-                print(f"  WARNING: Transformation failed for {analysis['module']}: {e}")
+                elapsed = time.time() - t0
+                print(f" FAILED {elapsed:.1f}s: {e}")
             time.sleep(1)
-        print(f"  Transformed {transformed} files with teacher model (Pass 2)")
+        pass2_elapsed = time.time() - pass2_start
+        print(f"  Transformed {transformed}/{len(changed_files)} files in {pass2_elapsed:.1f}s (avg {pass2_elapsed/max(len(changed_files),1):.1f}s/file)")
     else:
         print(f"[6/7] Pass 2 (Reduce): Skipped (mode={mode}, model={model_id is not None})")
 
@@ -621,8 +632,9 @@ def run_pipeline(
     print()
 
     nb_final = on.notebook_get(nb_id)
+    elapsed = time.time() - pipeline_start
     print(f"Notebook '{nb_final['name']}' — {nb_final['source_count']} sources, {nb_final['note_count']} notes")
-    print("Done.")
+    print(f"Pipeline completed in {elapsed:.1f}s ({elapsed/60:.1f}min)")
 
 
 # ---------------------------------------------------------------------------

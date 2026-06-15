@@ -207,6 +207,11 @@ class LibrarianClient:
         r.raise_for_status()
         return r.json()
 
+    def pipeline_status(self) -> dict:
+        r = self.session.get(f"{self.base_url}/pipeline-status", timeout=30)
+        r.raise_for_status()
+        return r.json()
+
 
 class MCPServer:
     def __init__(self):
@@ -352,6 +357,15 @@ class MCPServer:
             {
                 "name": "reload_librarian",
                 "description": "Reload the librarian index from disk after phonebook regeneration.",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "pipeline_status",
+                "description": (
+                    "Check the status of the indexing pipeline. Returns module count, edge count, "
+                    "phonebook directories, and indexed module names. Use this BEFORE relying on "
+                    "librarian data to verify the index is current and the 35B teacher pass has completed."
+                ),
                 "inputSchema": {"type": "object", "properties": {}},
             },
             {
@@ -536,6 +550,8 @@ class MCPServer:
         elif name == "reload_librarian":
             self.lib.reload()
             return {"status": "reloaded"}
+        elif name == "pipeline_status":
+            return self.lib.pipeline_status()
         elif name == "create_or_get_notebook":
             return self._create_or_get_notebook(**args)
         elif name == "ingest_source":

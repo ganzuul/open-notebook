@@ -102,9 +102,12 @@ For each cross-layer dependency you detect, emit exactly this JSON structure:
 CREDENTIAL_NAME = "Local Llama Server"
 CREDENTIAL_PROVIDER = "openai_compatible"
 CREDENTIAL_BASE_URL = "http://localhost:8080/v1"
+CREDENTIAL_EMBEDDING_URL = "http://localhost:8082/v1"
 
 MODEL_NAME_35B = "Qwen_Qwen3.6-35B-A3B-Q5_K_M.gguf"
 MODEL_TYPE = "language"
+EMBEDDING_MODEL_NAME = "bge-m3"
+EMBEDDING_MODEL_TYPE = "embedding"
 
 
 def api(method, path, data=None, timeout=30):
@@ -114,6 +117,8 @@ def api(method, path, data=None, timeout=30):
             r = requests.get(url, timeout=timeout)
         elif method == "post":
             r = requests.post(url, json=data, timeout=timeout)
+        elif method == "put":
+            r = requests.put(url, json=data, timeout=timeout)
         elif method == "delete":
             r = requests.delete(url, timeout=timeout)
         else:
@@ -175,6 +180,10 @@ def ensure_credential(reset=False):
 
     if existing and not reset:
         print(f"  Credential already exists: {existing['id']} ({existing['name']})")
+        if not existing.get("endpoint_embedding"):
+            r = api("put", f"/credentials/{existing['id']}", data={"endpoint_embedding": CREDENTIAL_EMBEDDING_URL})
+            if r.status_code == 200:
+                print(f"  Added embedding endpoint: {CREDENTIAL_EMBEDDING_URL}")
         return existing["id"]
     elif existing and reset:
         api("delete", f"/credentials/{existing['id']}")
@@ -184,6 +193,7 @@ def ensure_credential(reset=False):
         "name": CREDENTIAL_NAME,
         "provider": CREDENTIAL_PROVIDER,
         "base_url": CREDENTIAL_BASE_URL,
+        "endpoint_embedding": CREDENTIAL_EMBEDDING_URL,
         "api_key": "not-needed",
     })
     if r.status_code in (200, 201):
@@ -229,6 +239,59 @@ def ensure_model(cred_id, reset=False):
         return None
 
 
+def ensure_embedding_model(cred_id, reset=False):
+    models = api("get", "/models").json()
+    existing = None
+    for m in models:
+        if m.get("name") == EMBEDDING_MODEL_NAME:
+            existing = m
+            break
+
+    if existing and not reset:
+        print(f"  Embedding model already exists: {existing['id']} ({existing['name']})")
+        return existing["id"]
+    elif existing and reset:
+        api("delete", f"/models/{existing['id']}")
+        print(f"  Deleted old embedding model: {existing['id']}")
+
+    if not cred_id:
+        print("  ERROR: No credential ID, cannot create embedding model")
+        return None
+
+    r = api("post", "/models", data={
+        "name": EMBEDDING_MODEL_NAME,
+        "provider": CREDENTIAL_PROVIDER,
+        "type": EMBEDDING_MODEL_TYPE,
+        "credential": cred_id,
+    })
+    if r.status_code == 200:
+        model = r.json()
+        print(f"  Created embedding model: {model['id']} ({EMBEDDING_MODEL_NAME})")
+        return model["id"]
+    else:
+        print(f"  ERROR creating embedding model: {r.text[:200]}")
+        return None
+
+
+def ensure_defaults(cred_id, model_id, embedding_model_id):
+    defaults = api("get", "/models/defaults").json()
+    updates = {}
+    if defaults.get("default_transformation_model") != model_id:
+        updates["default_transformation_model"] = model_id
+    if defaults.get("default_embedding_model") != embedding_model_id:
+        updates["default_embedding_model"] = embedding_model_id
+    if defaults.get("default_chat_model") != model_id:
+        updates["default_chat_model"] = model_id
+    if updates:
+        r = api("put", "/models/defaults", data=updates)
+        if r.status_code == 200:
+            print(f"  Updated defaults: {list(updates.keys())}")
+        else:
+            print(f"  ERROR updating defaults: {r.text[:200]}")
+    else:
+        print("  Defaults already set correctly")
+
+
 def check_transformations():
     transforms = api("get", "/transformations").json()
     names = {t["name"] for t in transforms}
@@ -263,22 +326,47 @@ def full_status():
     if not cred_ok:
         print("  NO credential pointing to llama-server")
 
-    print("\n[5] Model:")
+    print("\n[5] Models:")
     models = api("get", "/models").json()
-    model_ok = False
+    llm_ok = False
+    embed_ok = False
     for m in models:
-        print(f"  Model: {m['id']} ({m['name']}, {m['provider']})")
+        tag = "(LLM)" if m.get("type") == "language" else "(embedding)" if m.get("type") == "embedding" else ""
+        print(f"  Model: {m['id']} {m['name']} {tag}")
         if m["name"] == MODEL_NAME_35B:
-            model_ok = True
-    if not model_ok:
+            llm_ok = True
+        if m["name"] == EMBEDDING_MODEL_NAME:
+            embed_ok = True
+    if not llm_ok:
         print(f"  NO model named {MODEL_NAME_35B}")
+    if not embed_ok:
+        print(f"  NO embedding model named {EMBEDDING_MODEL_NAME}")
 
-    print("\n[6] Notebooks:")
+    print("\n[6] Defaults:")
+    defaults = api("get", "/models/defaults").json()
+    for k, v in defaults.items():
+        if v:
+            print(f"  {k}: {v}")
+        else:
+            print(f"  {k}: (not set)")
+
+    print("\n[7] Notebooks:")
     notebooks = api("get", "/notebooks").json()
     for nb in notebooks:
         print(f"  {nb['name']}: {nb['source_count']} sources, {nb['note_count']} notes")
 
-    print("\n[7] Librarian server:")
+    print("\n[8] Embedding server:")
+    try:
+        r = requests.get("http://localhost:8082/health", timeout=3)
+        if r.status_code == 200:
+            info = r.json()
+            print(f"  Running: {info.get('model', '?')} (dim={info.get('dimension', '?')}, {info.get('device', '?')})")
+        else:
+            print("  ERROR: embedding server returned non-200")
+    except requests.ConnectionError:
+        print("  NOT RUNNING (start with: just embedding-start)")
+
+    print("\n[9] Librarian server:")
     try:
         r = requests.get("http://localhost:8081/modules", timeout=3)
         if r.status_code == 200:
@@ -289,7 +377,7 @@ def full_status():
     except requests.ConnectionError:
         print("  NOT RUNNING (start with: just librarian)")
 
-    print("\n[8] MCP bridge:")
+    print("\n[10] MCP bridge:")
     mcp_script = "/home/nos/labware/open-notebook/scripts/pipeline/mcp_librarian_server.py"
     import os
     if os.path.exists(mcp_script):
@@ -297,7 +385,7 @@ def full_status():
     else:
         print("  MCP script NOT FOUND")
 
-    all_ok = on_ok and llama_ok and transforms_ok and cred_ok and model_ok
+    all_ok = on_ok and llama_ok and transforms_ok and cred_ok and llm_ok and embed_ok
     print(f"\n{'='*40}")
     print(f"Overall: {'READY' if all_ok else 'NEEDS SETUP'}")
     return all_ok
@@ -329,10 +417,17 @@ def main():
     print("\n[4] Setting up credential...")
     cred_id = ensure_credential(reset=args.reset_models)
 
-    print("\n[5] Registering model...")
+    print("\n[5] Registering language model...")
     model_id = ensure_model(cred_id, reset=args.reset_models)
 
-    print("\n[6] Full status:")
+    print("\n[6] Registering embedding model...")
+    embedding_model_id = ensure_embedding_model(cred_id, reset=args.reset_models)
+
+    print("\n[7] Setting model defaults...")
+    if model_id and embedding_model_id:
+        ensure_defaults(cred_id, model_id, embedding_model_id)
+
+    print("\n[8] Full status:")
     full_status()
 
 

@@ -33,6 +33,8 @@ app = FastAPI(title="Librarian Index", version="2.0.0")
 phonebook_modules: list[dict] = []
 dependency_graph: dict = {"nodes": [], "edges": []}
 project_root: Path | None = None
+search_roots: list[Path] = []
+phonebook_dirs: list[Path] = []
 
 
 class QueryRequest(BaseModel):
@@ -107,16 +109,18 @@ def _parse_phonebook(path: Path) -> list[dict]:
 
 
 def load_phonebook():
-    global phonebook_modules, dependency_graph, project_root
+    global phonebook_modules, dependency_graph, project_root, search_roots, phonebook_dirs
     phonebook_modules.clear()
 
     search_roots = [
         Path("/home/nos/labware/open-notebook"),
         Path("/home/nos/labware/LaserCortex"),
     ]
+    phonebook_dirs = []
     for root in search_roots:
         for pb in root.rglob("MASTER_RECON_PHONEBOOK.md"):
             phonebook_modules.extend(_parse_phonebook(pb))
+            phonebook_dirs.append(pb.parent)
             project_root = pb.parent
 
         for dg in root.rglob("DEPENDENCY_GRAPH.json"):
@@ -173,10 +177,18 @@ def query(req: QueryRequest):
 
 @app.post("/check-freshness")
 def check_freshness(req: FreshnessRequest):
-    if not project_root:
-        return {"file_path": req.file_path, "status": "unknown", "reason": "no project root"}
-    fpath = project_root / req.file_path
-    if not fpath.exists():
+    fpath = Path(req.file_path)
+    if not fpath.is_absolute():
+        resolved = None
+        for d in phonebook_dirs:
+            candidate = d / req.file_path
+            if candidate.exists():
+                resolved = candidate
+                break
+        if not resolved:
+            return {"file_path": req.file_path, "status": "missing", "reason": "file not found in any phonebook root"}
+        fpath = resolved
+    elif not fpath.exists():
         return {"file_path": req.file_path, "status": "missing", "reason": "file not found"}
     sha = hashlib.sha256(fpath.read_bytes()).hexdigest()
     current = f"sha256:{sha[:16]}"
@@ -201,6 +213,17 @@ def check_freshness(req: FreshnessRequest):
 @app.get("/dependency-graph")
 def get_dependency_graph():
     return dependency_graph
+
+
+@app.get("/pipeline-status")
+def pipeline_status():
+    heuristic_only = [m["module"] for m in phonebook_modules if m.get("sha256")]
+    return {
+        "modules_indexed": len(phonebook_modules),
+        "edges_indexed": len(dependency_graph["edges"]),
+        "phonebook_dirs": [str(d) for d in phonebook_dirs],
+        "modules": heuristic_only,
+    }
 
 
 @app.post("/reload")
