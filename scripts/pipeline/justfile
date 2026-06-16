@@ -128,3 +128,28 @@ full-index repo: bootstrap
     just pipeline-full {{repo}}
     just librarian-reload
     @echo "Full indexing complete. Run 'just status' to verify."
+
+# ─── Docstring Sync ──────────────────────────────────────────────
+
+sync-docstrings-check:
+    python3 {{PIPELINE_DIR}}/sync_docstrings.py --check
+
+sync-docstrings-extract:
+    python3 {{PIPELINE_DIR}}/sync_docstrings.py --extract
+
+sync-docstrings-inject:
+    python3 {{PIPELINE_DIR}}/sync_docstrings.py --inject
+
+sync-docstrings: sync-docstrings-extract sync-docstrings-inject
+    @echo "Bidirectional sync complete."
+
+# ─── Nightly Batch ───────────────────────────────────────────────
+
+nightly:
+    {{PIPELINE_DIR}}/nightly_batch.sh
+
+nightly-dry-run:
+    {{PIPELINE_DIR}}/nightly_batch.sh --dry-run
+
+nightly-pipeline-only:
+    {{PIPELINE_DIR}}/nightly_batch.sh --pipeline-only
