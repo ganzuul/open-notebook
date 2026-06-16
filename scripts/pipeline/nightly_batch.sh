@@ -72,22 +72,21 @@ else
 fi
 
 # ---- 2. Wait for 35B ----
-log "Waiting for 35B to be ready..."
+log "Waiting for 35B to be ready (checking every 60s, up to 10min)..."
 if [ "$DRY_RUN" = false ]; then
-    for i in $(seq 1 180); do
+    for i in $(seq 1 10); do
+        sleep 60
         if curl -sf http://localhost:8080/v1/models > /dev/null 2>&1; then
-            log "35B ready after ${i}s"
+            log "35B ready after $((i * 60))s"
             break
         fi
-        if [ $i -eq 180 ]; then
-            log "ERROR: 35B failed to start within 180s, aborting"
-            kill "$PID_35B" 2>/dev/null || true
-            exit 1
+        if [ $i -eq 10 ]; then
+            log "ERROR: 35B did not become ready within 10 minutes — continuing without it"
+            log "WARN: transformations will fail; docstring sync will use existing notes"
         fi
-        sleep 10
     done
 else
-    log "[dry-run] Would wait for 35B readiness"
+    log "[dry-run] Would wait for 35B readiness (up to 10min)"
 fi
 
 # ---- 3. Run full pipeline ----
