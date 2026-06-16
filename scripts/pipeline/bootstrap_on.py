@@ -17,7 +17,7 @@ import sys
 import requests
 
 ON_URL = "http://localhost:5055/api"
-LLAMA_URL = "http://localhost:8080/v1"
+LLAMA_URL = "http://localhost:11434/v1"
 
 TRANSFORMATIONS = [
     {
@@ -101,10 +101,10 @@ For each cross-layer dependency you detect, emit exactly this JSON structure:
 
 CREDENTIAL_NAME = "Local Llama Server"
 CREDENTIAL_PROVIDER = "openai_compatible"
-CREDENTIAL_BASE_URL = "http://localhost:8080/v1"
+CREDENTIAL_BASE_URL = "http://localhost:11434/v1"
 CREDENTIAL_EMBEDDING_URL = "http://localhost:8082/v1"
 
-MODEL_NAME_35B = "Qwen_Qwen3.6-35B-A3B-Q5_K_M.gguf"
+MODEL_NAME_LLM = "Qwen_Qwen3.5-9B-Q4_K_M.gguf"
 MODEL_TYPE = "language"
 EMBEDDING_MODEL_NAME = "bge-m3"
 EMBEDDING_MODEL_TYPE = "embedding"
@@ -209,7 +209,7 @@ def ensure_model(cred_id, reset=False):
     models = api("get", "/models").json()
     existing = None
     for m in models:
-        if m.get("name") == MODEL_NAME_35B:
+        if m.get("name") == MODEL_NAME_LLM:
             existing = m
             break
 
@@ -225,14 +225,14 @@ def ensure_model(cred_id, reset=False):
         return None
 
     r = api("post", "/models", data={
-        "name": MODEL_NAME_35B,
+        "name": MODEL_NAME_LLM,
         "provider": CREDENTIAL_PROVIDER,
         "type": MODEL_TYPE,
         "credential": cred_id,
     })
     if r.status_code == 200:
         model = r.json()
-        print(f"  Created model: {model['id']} ({MODEL_NAME_35B})")
+        print(f"  Created model: {model['id']} ({MODEL_NAME_LLM})")
         return model["id"]
     else:
         print(f"  ERROR creating model: {r.text[:200]}")
@@ -333,12 +333,12 @@ def full_status():
     for m in models:
         tag = "(LLM)" if m.get("type") == "language" else "(embedding)" if m.get("type") == "embedding" else ""
         print(f"  Model: {m['id']} {m['name']} {tag}")
-        if m["name"] == MODEL_NAME_35B:
+        if m["name"] == MODEL_NAME_LLM:
             llm_ok = True
         if m["name"] == EMBEDDING_MODEL_NAME:
             embed_ok = True
     if not llm_ok:
-        print(f"  NO model named {MODEL_NAME_35B}")
+        print(f"  NO model named {MODEL_NAME_LLM}")
     if not embed_ok:
         print(f"  NO embedding model named {EMBEDDING_MODEL_NAME}")
 

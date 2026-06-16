@@ -88,9 +88,7 @@ llama-9b:
         --flash-attn on --jinja \
         --chat-template-kwargs '{"preserve_thinking":true}' \
         --ctx-size 65536 --cache-type-k q4_0 --cache-type-v q4_0 \
-        --cram 8192 \
-        --slot-save-path /var/cache/llama/slots \
-        --system-prompt-file /home/nos/labware/open-notebook/scripts/pipeline/PHONEBOOK_SYSTEM_PROMPT.md \
+        --cache-ram 8192 \
         --parallel 2 --host 0.0.0.0 --port 11434
 
 # ─── Embedding Server ──────────────────────────────────────────
