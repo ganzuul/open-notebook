@@ -28,7 +28,7 @@ LLAMA_URL_9B = CREDENTIAL_BASE_URL_9B
 # --- 35B Teacher (transformations, nighttime) ---
 CREDENTIAL_NAME_35B = "35B Teacher (nightly, port 8080)"
 CREDENTIAL_BASE_URL_35B = "http://localhost:8080/v1"
-MODEL_NAME_35B = "Qwen_Qwen3.6-35B-A3B-Q5_K_M.gguf"
+MODEL_NAME_35B = "Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
 
 # --- Embedding ---
 CREDENTIAL_EMBEDDING_URL = "http://localhost:8082/v1"

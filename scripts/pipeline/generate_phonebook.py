@@ -71,10 +71,16 @@ SKIP_PATTERNS = [
     ".phonebook_cache.json",
     "node_modules/",
     "__pycache__/",
+    ".pytest_cache/",
+    ".mypy_cache/",
     ".git/",
+    ".lake/",           # mathlib dependency — not our code
+    "_archive/",        # historical/abandoned
     "dist/",
     "build/",
     ".next/",
+    ".venv/",
+    "venv/",
 ]
 
 # ---------------------------------------------------------------------------
@@ -192,6 +198,14 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def save_cache_atomic(cache: dict, cache_path: Path):
+    """Write cache atomically via temp file + POSIX rename."""
+    tmp = cache_path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(cache, f, indent=2)
+    tmp.rename(cache_path)
 
 
 def detect_language(path: Path) -> str:
@@ -315,7 +329,7 @@ SUPPORTED_EXTENSIONS = set(EXTENSION_MAP.keys())
 def collect_files(root: Path) -> list[Path]:
     files = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in (".git", "__pycache__", "node_modules", ".next", "dist", "build")]
+        dirnames[:] = [d for d in dirnames if d not in (".git", ".lake", "_archive", "__pycache__", ".pytest_cache", "node_modules", ".next", "dist", "build")]
         for fname in filenames:
             fpath = Path(dirpath) / fname
             rel = fpath.relative_to(root)
@@ -324,6 +338,40 @@ def collect_files(root: Path) -> list[Path]:
             if fpath.suffix.lower() in SUPPORTED_EXTENSIONS:
                 files.append(fpath)
     return sorted(files)
+
+
+def resolve_included_paths(root: Path, paths: list[str]) -> list[Path]:
+    """Resolve --include-path entries to actual files on disk.
+
+    Accepts absolute paths or paths relative to *root* (the repo).
+    Supports glob patterns (``*``, ``**/*.lean``).  Skips nonexistent
+    entries with a warning.  Files inside skipped directories (e.g.
+    ``.lake/packages/…``) are accepted — the caller injects them
+    *after* the walk.
+    """
+    from glob import glob as globmatch
+
+    result: list[Path] = []
+    for p in paths:
+        p = p.strip()
+        if not p:
+            continue
+        p_obj = Path(p)
+        if p_obj.is_absolute():
+            candidates = sorted(globmatch(str(p_obj), recursive=True))
+        else:
+            candidates = sorted(globmatch(str((root / p)), recursive=True))
+        if not candidates:
+            print(f"  WARNING: --include-path '{p}' does not match any file",
+                  file=sys.stderr)
+            continue
+        for c in candidates:
+            cp = Path(c)
+            if cp.is_file():
+                result.append(cp)
+    seen: set[Path] = set()
+    deduped = [rp for rp in result if rp not in seen and not seen.add(rp)]
+    return sorted(deduped)
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +443,10 @@ def run_pipeline(
     notebook_name: str | None = None,
     output_dir: Path | None = None,
     pass2: bool = True,
+    ranking_file: str | None = None,
+    top_k: int | None = None,
+    retry_dead: bool = False,
+    include_paths: list[str] | None = None,
 ):
     """
     3-pass pipeline per the spec (Gemini_and_Claude_on_implementation.md):
@@ -412,9 +464,14 @@ def run_pipeline(
 
     if model_id is None:
         models = on.models_list()
-        if models:
-            model_id = models[0]["id"]
-            print(f"  Using model: {models[0]['name']} ({model_id})")
+        # Prefer a language model (type == "language") over embedding models
+        lang_models = [m for m in models if m.get("type") == "language"]
+        chosen = lang_models[0] if lang_models else (models[0] if models else None)
+        if chosen:
+            model_id = chosen["id"]
+            print(f"  Using model: {chosen['name']} ({model_id})")
+        else:
+            print("  WARNING: no models found — LLM passes will be skipped")
 
     if notebook_name is None:
         notebook_name = root.name
@@ -430,7 +487,22 @@ def run_pipeline(
 
     print(f"[2/7] Collecting source files from {root}...")
     files = collect_files(root)
-    print(f"  Found {len(files)} source files")
+    print(f"  Found {len(files)} source files from walk")
+
+    # ── Inject manually included paths (bypass skip-dirs, e.g. .lake/packages/...) ──
+    if include_paths:
+        t1 = time.time()
+        added = resolve_included_paths(root, include_paths)
+        added_filtered = [p for p in added if p.suffix.lower() in SUPPORTED_EXTENSIONS]
+        existing = set(files)
+        for p in added_filtered:
+            if p not in existing:
+                files.append(p)
+                existing.add(p)
+        files.sort()
+        print(f"  Added {len(added_filtered)} manually included files ({time.time() - t1:.1f}s)")
+
+    print(f"  Total: {len(files)} source files")
 
     # --- Pass 1: Heuristic analysis + ON ingest ---
     print(f"[3/7] Pass 1 (Map): Running heuristic analysis...")
@@ -449,8 +521,18 @@ def run_pipeline(
         sha = file_sha256(fpath)
 
         cached = cache.get(rel)
-        if cached and cached.get("sha256", "").endswith(sha[:16]) and mode != "full":
+        if cached and cached.get("sha256", "").endswith(sha[:16]):
+            # Cache hit: reuse heuristic analysis
             entries.append(cached)
+            # Even in --full mode, skip if 35B transformation was already done
+            if mode == "full" and cached.get("transform_sha", "").endswith(sha[:16]):
+                # File already fully processed — skip
+                continue
+            # In fast/incremental mode, skip entirely
+            if mode != "full":
+                continue
+            # In full mode but transform is stale — schedule for re-transform
+            changed_files.append((fpath, content, cached))
             continue
 
         analysis = heuristic_analyze(fpath, content)
@@ -508,11 +590,73 @@ def run_pipeline(
     enriched_entries = {}
     if mode == "full" and model_id and changed_files and pass2:
         pass2_start = time.time()
-        print(f"[6/7] Pass 2 (Reduce): Running Context-Compiler-V1 on {len(changed_files)} files...")
+        total_files = len(changed_files)
+
+        # ---- Apply relevance ranking (if available) ----
+        ranked_files = list(changed_files)  # default: process all
+        if ranking_file and Path(ranking_file).exists():
+            try:
+                with open(ranking_file) as f:
+                    ranking_data = json.load(f)
+                score_map = {}
+                for r in ranking_data.get("ranked", []):
+                    score_map[r["path"]] = r["score"]
+                # Sort changed_files by score (descending), unscored last
+                def sort_key(item):
+                    rel = str(item[0].relative_to(root)) if not str(item[0]).startswith(str(root)) else str(item[0])
+                    # Normalize: ranking paths are relative to root
+                    try:
+                        rel_path = str(item[0].relative_to(root))
+                    except ValueError:
+                        rel_path = str(item[0])
+                    return -score_map.get(rel_path, 0.0)
+                ranked_files.sort(key=sort_key)
+                # Apply top-K cap only if explicitly set via --top-k
+                if top_k is not None:
+                    ranked_files = ranked_files[:max(1, top_k)]
+                    print(f"  Ranking applied: {len(changed_files)} → top-{len(ranked_files)} files "
+                          f"(--top-k {top_k})")
+                else:
+                    print(f"  Ranking applied: sort by relevance ({len(ranked_files)} files, no cap)")
+            except (json.JSONDecodeError, KeyError, OSError) as e:
+                print(f"  WARNING: Could not read ranking file {ranking_file}: {e}")
+                print(f"  Falling back to processing all {len(changed_files)} files")
+
+        # ---- Skip dead-lettered files (failed ≥3 times) ----
+        if not retry_dead:
+            alive = []
+            dead = []
+            for item in ranked_files:
+                rel = str(item[0].relative_to(root))
+                if cache.get(rel, {}).get("_dead_letter"):
+                    dead.append((rel, item))
+                else:
+                    alive.append(item)
+            if dead:
+                print(f"  Skipping {len(dead)} dead-lettered files (use --retry-dead to re-attempt):")
+                for rel, _ in dead:
+                    print(f"    - {rel}")
+            ranked_files = alive
+
+        print(f"[6/7] Pass 2 (Reduce): Running Context-Compiler-V1 on {len(ranked_files)}/{total_files} files...")
         transformed = 0
-        for i, (fpath, content, analysis) in enumerate(changed_files):
+        skipped_transformed = 0
+        for i, (fpath, content, analysis) in enumerate(ranked_files):
+            # Check if this file was already fully transformed (content hasn't changed)
+            rel = str(fpath.relative_to(root))
+            cached = cache.get(rel, {})
+            sha = file_sha256(fpath)
+            if cached.get("transform_sha", "").endswith(sha[:16]):
+                # Already transformed in a previous run — restore from cache
+                enriched_content = cached.get("_transformed_content", "")
+                if enriched_content:
+                    enriched_entries[analysis["module"]] = enriched_content
+                    skipped_transformed += 1
+                    print(f"  {analysis['module']} ({i+1}/{len(ranked_files)}) — cached ✓")
+                    continue
+
             t0 = time.time()
-            print(f"  Transforming {analysis['module']} ({i+1}/{len(changed_files)})...", end="", flush=True)
+            print(f"  Transforming {analysis['module']} ({i+1}/{len(ranked_files)})...", end="", flush=True)
             try:
                 result = on.transformation_execute(
                     transformation_id=TRANSFORMATION_CONTEXT_COMPILER,
@@ -535,14 +679,36 @@ def run_pipeline(
                     enriched_entries[analysis["module"]] = enriched_content
                     transformed += 1
                     print(f" {elapsed:.1f}s ({len(enriched_content)} chars)")
+
+                    # Update transform cache
+                    cache.setdefault(rel, {})["transform_sha"] = sha[:16]
+                    # Store a preview of the transformed content (first 200 chars for cache validation)
+                    cache[rel]["_transformed"] = True
+                    cache[rel]["_transformed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    # Save cache periodically (every 5 successful transforms)
+                    if transformed % 5 == 0:
+                        save_cache_atomic(cache, cache_path)
                 else:
                     print(f" {elapsed:.1f}s (empty output)")
             except Exception as e:
                 elapsed = time.time() - t0
                 print(f" FAILED {elapsed:.1f}s: {e}")
+                # Dead-letter tracking: skip file permanently after 3 failures
+                cache.setdefault(rel, {})
+                cache[rel]["_fail_count"] = cache[rel].get("_fail_count", 0) + 1
+                if cache[rel]["_fail_count"] >= 3:
+                    cache[rel]["_dead_letter"] = True
+                    print(f"  ⚠ Quarantined {rel} — will skip on future runs (use --retry-dead to re-attempt)")
+                save_cache_atomic(cache, cache_path)
             time.sleep(1)
+
+        # Final cache save after Pass 2
+        save_cache_atomic(cache, cache_path)
+
         pass2_elapsed = time.time() - pass2_start
-        print(f"  Transformed {transformed}/{len(changed_files)} files in {pass2_elapsed:.1f}s (avg {pass2_elapsed/max(len(changed_files),1):.1f}s/file)")
+        transformed_total = transformed + skipped_transformed
+        print(f"  Transformed {transformed} new + {skipped_transformed} cached = {transformed_total}/{total_files} files "
+              f"in {pass2_elapsed:.1f}s (avg {pass2_elapsed / max(transformed_total, 1):.1f}s/file)")
     else:
         print(f"[6/7] Pass 2 (Reduce): Skipped (mode={mode}, model={model_id is not None})")
 
@@ -623,8 +789,7 @@ def run_pipeline(
     phonebook_path.write_text("\n".join(pb_lines))
     graph_path.write_text(json.dumps(dep_graph, indent=2, ensure_ascii=False))
 
-    with open(cache_path, "w") as f:
-        json.dump(cache, f, indent=2)
+    save_cache_atomic(cache, cache_path)
 
     print(f"  Wrote {phonebook_path}")
     print(f"  Wrote {graph_path}")
@@ -654,12 +819,36 @@ def main():
     parser.add_argument("--model-id", type=str, default=None, help="ON model ID for the teacher (35B). Auto-detected if omitted.")
     parser.add_argument("--notebook-name", type=str, default=None, help="ON notebook name (defaults to directory name)")
     parser.add_argument("--output-dir", type=Path, default=None, help="Directory for phonebook artifacts")
+    parser.add_argument("--ranking-file", type=str, default=None,
+                        help="Path to ranking JSON (/tmp/lasercortex_ranking.json) for Pass 2 file selection")
+    parser.add_argument("--top-k", type=int, default=None,
+                        help="Cap Pass 2 to top-K changed files by relevance (default: no cap, process all changed)")
     parser.add_argument("--no-pass2", action="store_true", help="Skip Pass 2 (Reduce) and Pass 3 (Link) even in full mode")
+    parser.add_argument("--retry-dead", action="store_true",
+                        help="Re-attempt files that were quarantined after 3 failures")
+    parser.add_argument("--include-path", type=str, action="append", default=[],
+                        help="File path to include (bypasses skip-dirs; can be repeated, supports globs)")
+    parser.add_argument("--include-list", type=str, default=None,
+                        help="File containing paths to include (one per line)")
     args = parser.parse_args()
 
     if not args.root.is_dir():
         print(f"Error: {args.root} is not a directory", file=sys.stderr)
         sys.exit(1)
+
+    # Build include_paths list from --include-path + --include-list
+    include_paths: list[str] = list(args.include_path)
+    if args.include_list:
+        try:
+            with open(args.include_list) as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("#"):
+                        include_paths.append(stripped)
+        except OSError as e:
+            print(f"Error: Cannot read --include-list '{args.include_list}': {e}",
+                  file=sys.stderr)
+            sys.exit(1)
 
     run_pipeline(
         root=args.root,
@@ -668,6 +857,10 @@ def main():
         notebook_name=args.notebook_name,
         output_dir=args.output_dir,
         pass2=not args.no_pass2,
+        ranking_file=args.ranking_file,
+        top_k=args.top_k,
+        retry_dead=args.retry_dead,
+        include_paths=include_paths,
     )
 
 

@@ -1,35 +1,37 @@
 #!/usr/bin/env bash
-# nightly_batch.sh — Nightly batch job: start 35B, run full pipeline, sync, research, stop.
+# nightly_batch.sh — Nightly batch: swap 9B→35B, run full pipeline, leave 35B loaded.
 #
-# This embodies the day/night rhythm:
-#   Daytime: 9B for chat, research questions logged to RESEARCH_FILE
-#   Nighttime: 35B starts, processes transformations, syncs docstrings,
-#              does web research on logged questions, then shuts down.
+# Principle: never unload a model unless another is being loaded or manually requested.
+#   1. Stop 9B (if running) → start 35B (if not already running)
+#   2. Run full pipeline
+#   3. DONE — 35B stays in VRAM for subsequent use
+#   4. To swap back to 9B, run: morning_batch.sh
 #
 # Usage:
 #   ./nightly_batch.sh                    # normal run
 #   ./nightly_batch.sh --pipeline-only    # skip research
 #   ./nightly_batch.sh --dry-run          # show what would happen
+#   ./nightly_batch.sh --force            # re-run pipeline even if 35B was already loaded
 
 set -euo pipefail
 
 # ---- Config ----
 REPO_DIR="/home/nos/labware/LaserCortex"
 ON_DIR="/home/nos/labware/open-notebook"
+LLOCO_DIR="/home/nos/labware/llocollama"
 RESEARCH_FILE="${REPO_DIR}/research_questions.md"
 LOGFILE="/tmp/on-nightly-$(date +%Y%m%d-%H%M).log"
 LOCKFILE="/tmp/on-nightly.lock"
-MODEL_PATH="/run/media/nos/games/models/Qwen_Qwen3.6-35B-A3B-Q5_K_M.gguf"
+
+MODEL_35B_PATH="/run/media/nos/games/models/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
+MODEL_9B_PATH="/run/media/nos/games/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf"
+PORT_35B=8080
+PORT_9B=11434
 
 # ---- Helpers ----
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOGFILE"; }
 cleanup() {
     log "Cleaning up..."
-    if [ -n "${PID_35B:-}" ]; then
-        kill "$PID_35B" 2>/dev/null || true
-        wait "$PID_35B" 2>/dev/null || true
-        log "35B stopped"
-    fi
     rm -f "$LOCKFILE"
 }
 
@@ -44,62 +46,99 @@ touch "$LOCKFILE"
 # ---- Parse args ----
 DRY_RUN=false
 PIPELINE_ONLY=false
+FORCE=false
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
         --pipeline-only) PIPELINE_ONLY=true ;;
+        --force) FORCE=true ;;
     esac
 done
 
 log "=== Nightly Batch Start ==="
-log "Pipeline-only: $PIPELINE_ONLY"
-log "Dry-run: $DRY_RUN"
+log "Pipeline-only: $PIPELINE_ONLY | Dry-run: $DRY_RUN | Force: $FORCE"
 
-# ---- 1. Start 35B ----
-log "Starting 35B teacher on :8080..."
-if [ "$DRY_RUN" = true ]; then
-    log "[dry-run] Would start: $MODEL_PATH on :8080"
-    PID_35B=99999  # dummy
+# ---- 1. Ensure 35B is running ----
+log "Checking 35B on :$PORT_35B..."
+if curl -sf "http://localhost:$PORT_35B/v1/models" > /dev/null 2>&1; then
+    log "35B already loaded — skipping model swap"
+    if [ "$FORCE" = false ]; then
+        log "Use --force to re-run the pipeline even if 35B was already loaded"
+    fi
 else
-    /home/nos/labware/llocollama/llama-server-turboquant \
-        --model "$MODEL_PATH" \
-        --flash-attn on --jinja \
-        --chat-template-kwargs '{"preserve_thinking":true}' \
-        --ctx-size 65536 --cache-type-k turbo4 --cache-type-v turbo3 \
-        --parallel 1 --host 0.0.0.0 --port 8080 > /tmp/llama-35b.log 2>&1 &
-    PID_35B=$!
-    log "35B PID: $PID_35B"
+    log "35B not running — swapping 9B→35B via manage.sh"
+    if [ "$DRY_RUN" = false ]; then
+        # Read the research query from research_questions.md (first non-empty, non-comment line)
+        RESEARCH_QUERY=$(grep -v '^#' "$RESEARCH_FILE" 2>/dev/null | grep -v '^-' | grep -v '^$' | head -1 || echo "")
+        if [ -z "$RESEARCH_QUERY" ]; then
+            RESEARCH_QUERY="Lean4 formal verification of geometric theorems, Tamari lattice, and binary tree enumeration"
+        fi
+        # manage.sh handles: parallel vmtouch + ranking, then starts 35B
+        cd "$LLOCO_DIR"
+        ./manage.sh swap 35b --query "$RESEARCH_QUERY" 2>&1 | tee -a "$LOGFILE"
+        # Wait for 35B (manage.sh starts it + server init takes ~6 min)
+        log "Waiting for 35B to be ready (checking every 15s, up to 10min)..."
+        for i in $(seq 1 40); do
+            sleep 15
+            if curl -sf "http://localhost:$PORT_35B/v1/models" > /dev/null 2>&1; then
+                log "35B ready after $((i * 15))s"
+                break
+            fi
+            if [ $i -eq 40 ]; then
+                log "ERROR: 35B did not become ready within 10 minutes"
+            fi
+        done
+    else
+        log "[dry-run] Would run: manage.sh swap 35b --query \"...\""
+    fi
 fi
 
-# ---- 2. Wait for 35B ----
-log "Waiting for 35B to be ready (checking every 60s, up to 10min)..."
-if [ "$DRY_RUN" = false ]; then
-    for i in $(seq 1 10); do
-        sleep 60
-        if curl -sf http://localhost:8080/v1/models > /dev/null 2>&1; then
-            log "35B ready after $((i * 60))s"
-            break
-        fi
-        if [ $i -eq 10 ]; then
-            log "ERROR: 35B did not become ready within 10 minutes — continuing without it"
-            log "WARN: transformations will fail; docstring sync will use existing notes"
-        fi
-    done
-else
-    log "[dry-run] Would wait for 35B readiness (up to 10min)"
-fi
-
-# ---- 3. Run full pipeline ----
+# ---- 2. Run full pipeline (capped at 144 files via --top-k for ~3h budget) ----
+RANKING_FILE="/tmp/lasercortex_ranking.json"
 log "Running full pipeline (generate_phonebook --mode full)..."
 if [ "$DRY_RUN" = true ]; then
-    log "[dry-run] Would run: python3 generate_phonebook.py --mode full"
+    log "[dry-run] Would run: python3 generate_phonebook.py --mode full --ranking-file \"$RANKING_FILE\" \"$REPO_DIR\""
 else
     cd "$ON_DIR"
-    python3 scripts/pipeline/generate_phonebook.py --mode full 2>&1 | tee -a "$LOGFILE"
+    RANKING_ARGS=""
+    if [ -f "$RANKING_FILE" ]; then
+        RANKING_ARGS="--ranking-file $RANKING_FILE"
+        log "  Using ranking file: $RANKING_FILE"
+    else
+        log "  No ranking file found — processing all changed files (may exceed 3h)"
+    fi
+    INCLUDE_ARGS=""
+    MANUAL_QUEUE="${REPO_DIR}/.manual_pipeline_queue"
+    if [ -f "$MANUAL_QUEUE" ] && [ -s "$MANUAL_QUEUE" ]; then
+        INCLUDE_ARGS="--include-list $MANUAL_QUEUE"
+        log "  Manual pipeline queue: $MANUAL_QUEUE ($(wc -l < "$MANUAL_QUEUE") entries)"
+    fi
+    python3 scripts/pipeline/generate_phonebook.py --mode full --top-k 144 $RANKING_ARGS $INCLUDE_ARGS "$REPO_DIR" 2>&1 | tee -a "$LOGFILE"
     log "Pipeline complete"
+
+    # ── Clear manual pipeline queue ──
+    if [ -f "$MANUAL_QUEUE" ]; then
+        # Re-create with only the header template
+        cat > "$MANUAL_QUEUE" <<'EOF'
+# Manual Pipeline Queue — one file path per line
+#
+# Files listed here will be included in the next nightly pipeline run,
+# even if they are inside excluded directories (.lake, _archive, etc).
+# Paths can be absolute or relative to the repo root. Globs supported.
+#
+# Usage:
+#   Add a line below during daytime work, then the next nightly batch
+#   will automatically pick it up. The queue is cleared after processing.
+#
+# Examples:
+#   .lake/packages/mathlib4/Mathlib/Data/List/Basic.lean
+#   .lake/packages/mathlib4/Mathlib/Algebra/Group.lean
+EOF
+        log "  Cleared manual pipeline queue"
+    fi
 fi
 
-# ---- 4. Sync docstrings (inject Deep Analysis → Lean) ----
+# ---- 3. Sync docstrings (inject Deep Analysis → Lean) ----
 log "Syncing docstrings (--inject)..."
 if [ "$DRY_RUN" = true ]; then
     log "[dry-run] Would run: sync_docstrings.py --inject"
@@ -108,7 +147,7 @@ else
     log "Docstring sync complete"
 fi
 
-# ---- 5. Web research for logged questions ----
+# ---- 4. Web research for logged questions ----
 if [ "$PIPELINE_ONLY" = false ]; then
     if [ -f "$RESEARCH_FILE" ] && [ -s "$RESEARCH_FILE" ]; then
         log "Processing research questions from ${RESEARCH_FILE}..."
@@ -116,25 +155,19 @@ if [ "$PIPELINE_ONLY" = false ]; then
             log "[dry-run] Would read questions and run web search for each"
         else
             cd "$REPO_DIR"
-            # Read questions line by line (non-empty, non-comment lines)
             while IFS= read -r line; do
-                line="${line#\#}"  # strip leading #
-                line="$(echo "$line" | xargs)"  # trim
+                line="${line#\#}"
+                line="$(echo "$line" | xargs)"
                 [ -z "$line" ] && continue
                 [[ "$line" == -* ]] && continue
                 log "  Researching: $line"
-                # Run web search via a lightweight script
+                # For now, just log — replace with actual web search tool invocation
                 python3 -c "
-import json, subprocess, sys, requests
-query = sys.argv[1]
-# We use a simple web search approach: fetch results and post as ON note
-# For now, just log the query
-print(f'QUESTION: {query}')
+import sys; print(f'QUESTION: {sys.argv[1]}')
 " "$line" 2>&1 | tee -a "$LOGFILE"
             done < "$RESEARCH_FILE"
-            # Clear the research file after processing
             echo "" > "$RESEARCH_FILE"
-            git add "$RESEARCH_FILE"
+            git add "$RESEARCH_FILE" 2>/dev/null || true
             git commit -m "nightly: clear processed research questions" || true
             log "Research complete"
         fi
@@ -145,7 +178,7 @@ else
     log "Skipping research (--pipeline-only)"
 fi
 
-# ---- 6. Commit any file changes ----
+# ---- 5. Commit any file changes ----
 log "Committing docstring changes..."
 if [ "$DRY_RUN" = true ]; then
     log "[dry-run] Would commit changes in LaserCortex"
@@ -161,17 +194,9 @@ else
     fi
 fi
 
-# ---- 7. Stop 35B ----
-log "Stopping 35B..."
-if [ "$DRY_RUN" = true ]; then
-    log "[dry-run] Would stop 35B (PID $PID_35B)"
-else
-    kill "$PID_35B" 2>/dev/null || true
-    wait "$PID_35B" 2>/dev/null || true
-    log "35B stopped"
-fi
-
 # ---- Done ----
 log "=== Nightly Batch Complete ==="
+log "35B left loaded on :$PORT_35B"
+log "Swap back to 9B: $LLOCO_DIR/manage.sh swap 9b"
 echo "" | tee -a "$LOGFILE"
 echo "Log: $LOGFILE"

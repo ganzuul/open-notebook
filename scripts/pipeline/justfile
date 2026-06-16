@@ -75,7 +75,7 @@ pipeline-full repo:
 llama-35b:
     @echo "Starting 35B teacher model on :8080..."
     /home/nos/labware/llocollama/llama-server-turboquant \
-        --model /run/media/nos/games/models/Qwen_Qwen3.6-35B-A3B-Q5_K_M.gguf \
+        --model /run/media/nos/games/models/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf \
         --flash-attn on --jinja \
         --chat-template-kwargs '{"preserve_thinking":true}' \
         --ctx-size 65536 --cache-type-k turbo4 --cache-type-v turbo3 \
