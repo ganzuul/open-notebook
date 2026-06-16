@@ -17,7 +17,23 @@ import sys
 import requests
 
 ON_URL = "http://localhost:5055/api"
-LLAMA_URL = "http://localhost:11434/v1"
+
+# --- 9B Student (chat, daytime) ---
+CREDENTIAL_NAME_9B = "Local Llama Server (9B, chat)"
+CREDENTIAL_PROVIDER = "openai_compatible"
+CREDENTIAL_BASE_URL_9B = "http://localhost:11434/v1"
+MODEL_NAME_9B = "Qwen_Qwen3.5-9B-Q4_K_M.gguf"
+LLAMA_URL_9B = CREDENTIAL_BASE_URL_9B
+
+# --- 35B Teacher (transformations, nighttime) ---
+CREDENTIAL_NAME_35B = "35B Teacher (nightly, port 8080)"
+CREDENTIAL_BASE_URL_35B = "http://localhost:8080/v1"
+MODEL_NAME_35B = "Qwen_Qwen3.6-35B-A3B-Q5_K_M.gguf"
+
+# --- Embedding ---
+CREDENTIAL_EMBEDDING_URL = "http://localhost:8082/v1"
+EMBEDDING_MODEL_NAME = "bge-m3"
+EMBEDDING_MODEL_TYPE = "embedding"
 
 TRANSFORMATIONS = [
     {
@@ -99,12 +115,8 @@ For each cross-layer dependency you detect, emit exactly this JSON structure:
     },
 ]
 
-CREDENTIAL_NAME = "Local Llama Server"
 CREDENTIAL_PROVIDER = "openai_compatible"
-CREDENTIAL_BASE_URL = "http://localhost:11434/v1"
 CREDENTIAL_EMBEDDING_URL = "http://localhost:8082/v1"
-
-MODEL_NAME_LLM = "Qwen_Qwen3.5-9B-Q4_K_M.gguf"
 MODEL_TYPE = "language"
 EMBEDDING_MODEL_NAME = "bge-m3"
 EMBEDDING_MODEL_TYPE = "embedding"
@@ -142,15 +154,15 @@ def check_on_health():
 
 def check_llama():
     try:
-        r = requests.get(f"{LLAMA_URL}/models", timeout=5)
+        r = requests.get(f"{LLAMA_URL_9B}/models", timeout=5)
         if r.status_code == 200:
             models = r.json().get("data", [])
             model_id = models[0].get("id", "?") if models else "none"
-            print(f"  Llama-server model: {model_id}")
+            print(f"  Llama-server (9B) model: {model_id}")
             return True
         return False
     except requests.ConnectionError:
-        print(f"  ERROR: Cannot connect to llama-server at {LLAMA_URL}")
+        print(f"  ERROR: Cannot connect to llama-server at {LLAMA_URL_9B}")
         return False
 
 
@@ -170,51 +182,55 @@ def ensure_transformations():
     return created
 
 
-def ensure_credential(reset=False):
+def ensure_credential(name, base_url, embedding_url=None, reset=False):
     creds = api("get", "/credentials").json()
     existing = None
     for c in creds:
-        if c.get("base_url") == CREDENTIAL_BASE_URL:
+        if c.get("base_url") == base_url:
             existing = c
             break
 
     if existing and not reset:
-        print(f"  Credential already exists: {existing['id']} ({existing['name']})")
-        if not existing.get("endpoint_embedding"):
-            r = api("put", f"/credentials/{existing['id']}", data={"endpoint_embedding": CREDENTIAL_EMBEDDING_URL})
-            if r.status_code == 200:
-                print(f"  Added embedding endpoint: {CREDENTIAL_EMBEDDING_URL}")
+        if existing.get("name") != name:
+            # Update name if changed
+            api("put", f"/credentials/{existing['id']}", data={"name": name})
+        if embedding_url and not existing.get("endpoint_embedding"):
+            api("put", f"/credentials/{existing['id']}", data={"endpoint_embedding": embedding_url})
+        print(f"  Credential: {existing['id']} ({name}, {base_url})")
         return existing["id"]
     elif existing and reset:
         api("delete", f"/credentials/{existing['id']}")
         print(f"  Deleted old credential: {existing['id']}")
 
-    r = api("post", "/credentials", data={
-        "name": CREDENTIAL_NAME,
+    payload = {
+        "name": name,
         "provider": CREDENTIAL_PROVIDER,
-        "base_url": CREDENTIAL_BASE_URL,
-        "endpoint_embedding": CREDENTIAL_EMBEDDING_URL,
+        "base_url": base_url,
         "api_key": "not-needed",
-    })
+    }
+    if embedding_url:
+        payload["endpoint_embedding"] = embedding_url
+
+    r = api("post", "/credentials", data=payload)
     if r.status_code in (200, 201):
         cred = r.json()
-        print(f"  Created credential: {cred['id']} ({CREDENTIAL_BASE_URL})")
+        print(f"  Created credential: {cred['id']} ({name}, {base_url})")
         return cred["id"]
     else:
         print(f"  ERROR creating credential: {r.text[:200]}")
         return None
 
 
-def ensure_model(cred_id, reset=False):
+def ensure_model(name, cred_id, reset=False):
     models = api("get", "/models").json()
     existing = None
     for m in models:
-        if m.get("name") == MODEL_NAME_LLM:
+        if m.get("name") == name:
             existing = m
             break
 
     if existing and not reset:
-        print(f"  Model already exists: {existing['id']} ({existing['name']})")
+        print(f"  Model already exists: {existing['id']} ({name})")
         return existing["id"]
     elif existing and reset:
         api("delete", f"/models/{existing['id']}")
@@ -225,14 +241,14 @@ def ensure_model(cred_id, reset=False):
         return None
 
     r = api("post", "/models", data={
-        "name": MODEL_NAME_LLM,
+        "name": name,
         "provider": CREDENTIAL_PROVIDER,
         "type": MODEL_TYPE,
         "credential": cred_id,
     })
     if r.status_code == 200:
         model = r.json()
-        print(f"  Created model: {model['id']} ({MODEL_NAME_LLM})")
+        print(f"  Created model: {model['id']} ({name})")
         return model["id"]
     else:
         print(f"  ERROR creating model: {r.text[:200]}")
@@ -273,15 +289,15 @@ def ensure_embedding_model(cred_id, reset=False):
         return None
 
 
-def ensure_defaults(cred_id, model_id, embedding_model_id):
+def ensure_defaults(chat_model_id, transform_model_id, embedding_model_id):
     defaults = api("get", "/models/defaults").json()
     updates = {}
-    if defaults.get("default_transformation_model") != model_id:
-        updates["default_transformation_model"] = model_id
+    if defaults.get("default_chat_model") != chat_model_id:
+        updates["default_chat_model"] = chat_model_id
+    if defaults.get("default_transformation_model") != transform_model_id:
+        updates["default_transformation_model"] = transform_model_id
     if defaults.get("default_embedding_model") != embedding_model_id:
         updates["default_embedding_model"] = embedding_model_id
-    if defaults.get("default_chat_model") != model_id:
-        updates["default_chat_model"] = model_id
     if updates:
         r = api("put", "/models/defaults", data=updates)
         if r.status_code == 200:
@@ -316,29 +332,39 @@ def full_status():
     print("\n[3] Transformations:")
     transforms_ok = check_transformations()
 
-    print("\n[4] Credential:")
+    print("\n[4] Credentials:")
     creds = api("get", "/credentials").json()
-    cred_ok = False
+    cred_9b_ok = cred_35b_ok = False
     for c in creds:
-        if c.get("base_url") == CREDENTIAL_BASE_URL:
-            print(f"  Credential: {c['id']} ({c['name']}, {c['base_url']})")
-            cred_ok = True
-    if not cred_ok:
-        print("  NO credential pointing to llama-server")
+        tag = ""
+        if "11434" in c.get("base_url", ""):
+            tag = " (9B chat)"
+            cred_9b_ok = True
+        elif "8080" in c.get("base_url", ""):
+            tag = " (35B transformation)"
+            cred_35b_ok = True
+        print(f"  Credential: {c['id']} ({c['name']}, {c.get('base_url','?')}){tag}")
+    if not cred_9b_ok:
+        print("  NO credential for 9B on :11434")
+    if not cred_35b_ok:
+        print("  NO credential for 35B on :8080")
 
     print("\n[5] Models:")
     models = api("get", "/models").json()
-    llm_ok = False
-    embed_ok = False
+    llm_9b_ok = llm_35b_ok = embed_ok = False
     for m in models:
         tag = "(LLM)" if m.get("type") == "language" else "(embedding)" if m.get("type") == "embedding" else ""
         print(f"  Model: {m['id']} {m['name']} {tag}")
-        if m["name"] == MODEL_NAME_LLM:
-            llm_ok = True
+        if m["name"] == MODEL_NAME_9B:
+            llm_9b_ok = True
+        if m["name"] == MODEL_NAME_35B:
+            llm_35b_ok = True
         if m["name"] == EMBEDDING_MODEL_NAME:
             embed_ok = True
-    if not llm_ok:
-        print(f"  NO model named {MODEL_NAME_LLM}")
+    if not llm_9b_ok:
+        print(f"  NO model named {MODEL_NAME_9B}")
+    if not llm_35b_ok:
+        print(f"  NO model named {MODEL_NAME_35B}")
     if not embed_ok:
         print(f"  NO embedding model named {EMBEDDING_MODEL_NAME}")
 
@@ -385,7 +411,7 @@ def full_status():
     else:
         print("  MCP script NOT FOUND")
 
-    all_ok = on_ok and llama_ok and transforms_ok and cred_ok and llm_ok and embed_ok
+    all_ok = on_ok and llama_ok and transforms_ok and cred_9b_ok and llm_9b_ok and embed_ok
     print(f"\n{'='*40}")
     print(f"Overall: {'READY' if all_ok else 'NEEDS SETUP'}")
     return all_ok
@@ -414,18 +440,30 @@ def main():
     print("\n[3] Creating transformations...")
     ensure_transformations()
 
-    print("\n[4] Setting up credential...")
-    cred_id = ensure_credential(reset=args.reset_models)
+    print("\n[4] Setting up credentials...")
+    print("  [4a] 9B Student (chat, daytime)...")
+    cred_id_9b = ensure_credential(CREDENTIAL_NAME_9B, CREDENTIAL_BASE_URL_9B,
+                                   embedding_url=CREDENTIAL_EMBEDDING_URL, reset=args.reset_models)
+    print("  [4b] 35B Teacher (transformations, nighttime)...")
+    cred_id_35b = ensure_credential(CREDENTIAL_NAME_35B, CREDENTIAL_BASE_URL_35B,
+                                   reset=args.reset_models)
 
-    print("\n[5] Registering language model...")
-    model_id = ensure_model(cred_id, reset=args.reset_models)
+    print("\n[5] Registering language models...")
+    print("  [5a] 9B chat model...")
+    model_id_9b = ensure_model(MODEL_NAME_9B, cred_id_9b, reset=args.reset_models)
+    print("  [5b] 35B transformation model...")
+    model_id_35b = ensure_model(MODEL_NAME_35B, cred_id_35b, reset=args.reset_models)
 
     print("\n[6] Registering embedding model...")
-    embedding_model_id = ensure_embedding_model(cred_id, reset=args.reset_models)
+    embedding_model_id = ensure_embedding_model(cred_id_9b, reset=args.reset_models)
 
     print("\n[7] Setting model defaults...")
-    if model_id and embedding_model_id:
-        ensure_defaults(cred_id, model_id, embedding_model_id)
+    print("  Chat → 9B, Transformations → 35B, Embedding → bge-m3")
+    if model_id_9b and model_id_35b and embedding_model_id:
+        ensure_defaults(chat_model_id=model_id_9b, transform_model_id=model_id_35b,
+                        embedding_model_id=embedding_model_id)
+    else:
+        print("  SKIP: one or more model IDs missing")
 
     print("\n[8] Full status:")
     full_status()
