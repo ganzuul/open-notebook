@@ -85,8 +85,8 @@ llama-9b:
     @echo "Starting 9B student model on :11434..."
     /home/nos/labware/llocollama/llama-server-turboquant \
         --model /run/media/nos/games/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf \
-        --flash-attn on --jinja \
-        --chat-template-kwargs '{"preserve_thinking":true}' \
+        --flash-attn on \
+        --no-jinja \
         --ctx-size 65536 --cache-type-k q4_0 --cache-type-v q4_0 \
         --cache-ram 8192 \
         --parallel 2 --host 0.0.0.0 --port 11434
