@@ -1,99 +1,206 @@
-# Librarian Gap Analysis — 2026-06-15
+# Librarian Gap Analysis — 2026-06-17 (Updated)
 
 ## What the librarian can do right now
 
 | Capability | Status |
 |---|---|
-| Find any Lean4 module by name, tag, or layer | Done — `query_librarian` returns EMLRegistry with 10 contracts, 1 export |
-| Check if a file changed since last indexing | Done — `check_freshness` with SHA256 |
-| See the dependency graph | Done — 97 nodes, 194 edges (mostly Python import edges from ON's own codebase) |
-| 35B Deep Analysis notes exist in ON for LaserCortex | Done — 18 notes in the LaserCortex-v2 notebook |
-| Search ON by text | Done — but currently returning 0 for semantic queries like "associator pentagon Stasheff" |
+| Find any module by name, tag, or layer | Done — 1400 entries indexed across 5 layers |
+| Heuristic import graph (IMPORT edges) | Done — 62 edges within FORMALIZATION and API_GATEWAY |
+| Cross-layer semantic edges (CONSTRAINT, DATA_SOURCE) | Done — 5 edges (E001-E005) via 35B Pass 3 linking |
+| 35B Deep Analysis notes in ON for LaserCortex | Done — 434 notes from 143/144 files |
+| Full 3-pass pipeline works end-to-end | Done — nightly pipeline completed |
+| GPU embedding ranking operational | Done — bge-m3 on GPU, 1397 files, 0 failures |
+| Search ON by text | Partial — returns titles + relevance scores, but NO content bodies |
+| MCP tools routing through ON API (port 5055) | Working: search_notes, create_or_get_notebook, ingest_source, run_transformation, create_note |
+| MCP tools routing through librarian server (port 8081) | ALL DEAD — port 8081 not started anywhere |
 
-## Gaps
+## Resolved Gaps (from 2026-06-15)
 
-### 1. Semantic search over Lean4 source content is empty
+### #2 (old): No cross-layer edges — DONE
 
-The `search_notes` query for "associator pentagon Stasheff" returned 0 results. The sources were ingested but not embedded (no embedding model configured). This means the ON vector search is useless for Lean4 content right now. The librarian's text search only works on the heuristic phonebook notes, not on the actual source code.
+The 35B Cross-Layer-Linker found 5 real semantic edges:
 
-### 2. No cross-layer edges between Lean4, Python, and TypeScript
+| ID | Type | Source -> Target |
+|----|------|-----------------|
+| E001 | DATA_SOURCE | Cost (Lean4) -> NodeCost (Python) |
+| E002 | CONSTRAINT | EMLRegistry (Lean4) -> EMLTree (Python) |
+| E003 | CONSTRAINT | AMM (Lean4) -> phi_cost (WebGPU) |
+| E004 | DATA_SOURCE | tamari_lattice_api (Python) -> TamariExplorer (TypeScript) |
+| E005 | CONSTRAINT | LogicTypes (Lean4) -> LogicTypesPipeline (Python) |
 
-The dependency graph has 194 edges, but they're all `DATA_SOURCE` edges between ON's own Python files. Zero edges connect the Lean4 formalization layer to the Python mirror or to the TypeScript frontend. The heuristic analysis can only find `IMPORT` edges within a single language. The spec's whole value proposition — `CONSTRAINT` edges from Lean4 theorems to Python/TypeScript runtime, `MUTATION_TRIGGER` edges from Python to Lean4 invariants — is missing.
+All have invariant_at_boundary and failure_mode fields. Spans FORMALIZATION -> API_GATEWAY -> PRESENTATION.
 
-### 3. Research paper references are not indexed at all
+### #6 (old): 35B Deep Analysis only tested — DONE
 
-The repo has ~20 unique paper references (arXiv papers, Tamari/Stasheff/Loday foundational works) and ~33 markdown documentation files, but none of them are in the LaserCortex notebook. The `docs/` directory phonebook was created in the `OpenNotebook` notebook, not the `LaserCortex` notebook, and those docs contain the research context that connects the Lean4 code to the underlying math.
+Full pipeline (Pass 2) completed: 143/144 files transformed by 35B Context-Compiler-V1.
+434 Deep Analysis notes in ON. One failure (422 on a session file).
 
-### 4. The Python mirror (`infra/_cortex/`) is not indexed
+### #3 (old): Research papers not indexed — DONE
 
-The Python files that directly mirror Lean4 formalization (`_eml_tree.py`, `_logic_types.py`, `_cost.py`, `_amm.py`, etc.) are not in any notebook. These are the bridge between the formalization layer and the runtime layer. Without them indexed, there's no way to answer "which Python file implements the same EMLTree structure as EMLRegistry.lean?"
+Full repo scan indexed 623 DOCUMENTATION entries including all docs/ files.
+Current gap: these are heuristic-only entries — they lack Deep Analysis (the 35B slot budget prioritized code files).
 
-### 5. The TypeScript/WebGPU code is not indexed
+### #4 (old): Python mirror not indexed — DONE
 
-The `canvas_app/` has ~55 TypeScript/TSX files and WebGPU shaders for visualizing the Tamari lattice and computing Φ on GPU. These have `#memory-topology` and `#webgpu-buffer` tags in the spec, but the actual files were ingested into the `LaserCortex-v2` notebook from the `LaserCortex/LaserCortex/` directory which only contains `.lean` files. The TypeScript source isn't in any notebook.
+474 API_GATEWAY entries indexed, covering all Python files across infra/, canvas_app/backend/, etc.
 
-### 6. The 35B Deep Analysis has only been tested, not run for real
+### #5 (old): TypeScript/WebGPU not indexed — DONE
 
-We tested the Context-Compiler-V1 transformation on one file (AMM.lean) and it produced excellent output (Tamari rotation connection, cross-refs to Cost/LogicTypes). But the full pipeline (`--mode full`) hasn't been run on all 18 Lean4 files. Each file takes ~100s with the 35B model, so that's ~30 minutes. The cross-layer linker (Pass 3) hasn't been run at all.
+78 PRESENTATION entries indexed covering TypeScript, TSX, WebGPU shaders, and vendor JS.
 
-### 7. No way to trace a Lean4 theorem to its paper reference
+## Current Gaps
 
-If formalizing Stasheff's pentagon identity, I need to know: which doc discusses it? Which Python file implements the corresponding computation? Which TypeScript component visualizes it? Right now these connections exist only in human memory, not in any indexed system.
+### G1: Missing service — Librarian Index Server (port 8081)
 
-### 8. The ON notebook structure doesn't match the repo structure
+Severity: CRITICAL — Six MCP tools are dead:
 
-There are two notebooks (LaserCortex-v2, OpenNotebook) whose names don't correspond to the actual repo structure. The repo has three coherent layers:
-- **Lean4** (`LaserCortex/*.lean`) — formalization
-- **Python** (`infra/_cortex/`, `canvas_app/backend/`) — mirror + runtime
-- **TypeScript/WebGPU** (`canvas_app/frontend/`) — visualization
+| Tool | Depends on | Status |
+|------|-----------|--------|
+| pipeline_status | port 8081 | Connection refused |
+| query_librarian | port 8081 | Connection refused |
+| check_freshness | port 8081 | Connection refused |
+| list_modules | port 8081 | Connection refused |
+| get_dependency_graph | port 8081 | Connection refused |
+| reload_librarian | port 8081 | Connection refused |
 
-Each should be a separate notebook or at least clearly delineated in the same notebook.
+The secondary FastAPI server (librarian_server.py) is documented as `just librarian-start`
+in the README but is NOT in Docker Compose, manage.sh, or any startup script.
 
-### 9. No incremental update mechanism
+**Fix**: Add to Docker Compose as a service, or integrate into manage.sh.
 
-The spec wants a git hook or file watcher that triggers `--incremental` when files change. Right now you have to manually run `just pipeline-incremental`.
+### G2: search_notes returns titles only, no content
 
-### 10. The 9B student model with cached phonebook isn't running
+Severity: HIGH — The ON API /search endpoint returns {id, title, relevance} but the actual
+note body requires a separate /api/notes/{id} call per result. The MCP search_notes tool
+doesn't auto-fetch content.
 
-The spec envisions the 9B model on port 11434 with the phonebook loaded as a system prompt via `--system-prompt-file`, giving the agent instant architectural awareness. This isn't deployed yet.
+This means you can discover WHAT is relevant but cannot see WHAT IT SAYS without 1+N API
+calls. For a developer asking "can the cost functions be improved?", the titles "Cost - Deep
+Analysis" and "phi_cost - Deep Analysis" are enough to route attention, but not to answer
+the question.
 
-## Priority actions
+**Fix**: Either (a) add include_content support to ON /search, or (b) have search_notes
+auto-fetch top-K note bodies and include them in the response.
 
-| Priority | Action | Closes gap |
-|---|---|---|
-| **P0** | Run `--mode full` on all 18 Lean files (~30 min) | #6 |
-| **P0** | Index `docs/` research papers into the LaserCortex notebook | #3 |
-| **P0** | Index `infra/_cortex/` Python mirror into the LaserCortex notebook | #4 |
-| **P1** | Configure an embedding model in ON for vector search | #1 |
-| **P1** | Run Pass 3 (Cross-Layer-Linker) to produce `CONSTRAINT`/`MUTATION_TRIGGER` edges | #2 |
-| **P1** | Index `canvas_app/` TypeScript/WebGPU files | #5 |
-| **P2** | Start 9B student on :11434 with `--system-prompt-file` | #10 |
-| **P2** | Add git hook for incremental updates | #9 |
-| **P2** | Create a notebook structure matching repo layers | #8 |
-| **P3** | Wire ON Notes to Lean4 docstrings (bidirectional link) | #7 |
+### G3: MCP tools not exposed as callable functions to the assistant
 
-## Repo Inventory Summary
+Severity: HIGH — The system prompt (and PHONEBOOK_SYSTEM_PROMPT.md) says:
 
-| Category | Count | Location |
-|----------|-------|----------|
-| Lean 4 library files | 17 | `LaserCortex/*.lean` |
-| Lean 4 standalone | 2 | `unified_spacetime_engine_explicit.lean`, `Visualization/loday_coordinates.lean` |
-| TypeScript/TSX (canvas frontend) | ~55 | `canvas_app/frontend/src/` |
-| JavaScript (vendors) | 8 | `blueprint/web/js/` |
-| Python (cortex mirror) | 16 | `infra/_cortex/` |
-| Python (canvas backend) | ~60 | `canvas_app/backend/` |
-| Python (infra core/examples/tests) | ~70 | `infra/core/`, `infra/examples/`, `infra/tests/` |
-| Documentation markdown | 33 | `docs/` |
-| Research paper references | ~20 | `docs/*.pdf`, `documentation/paper/`, `references.bib` |
-| Mathlib dependency | 1 | mathlib4 |
+  "You have access to the Open Notebook Librarian via MCP tools. Before reading
+   code files directly, use pipeline_status to check if the index is current,
+   then query_librarian or search_notes to find relevant modules."
 
-## Key ON IDs
+But these MCP tools are NOT in the assistant's callable function list. They are registered
+in ~/.config/opencode/opencode.jsonc under the "open-notebook-librarian" MCP server, but
+the server communicates via stdio JSON-RPC to the Opencode agent runtime — not via
+callable tools available to me.
+
+This means the spec promises a capability the assistant cannot actually invoke.
+
+**Fix**: Either (a) expose these as callable HTTP endpoints that the assistant can reach,
+or (b) add them as explicit function tools, or (c) update the system prompt to match
+reality.
+
+### G4: Chicken-and-egg freshness check
+
+Severity: MEDIUM — The spec says "Run pipeline_status first to verify the index is current"
+but pipeline_status requires port 8081 which isn't running. Even if it were, if the index
+is stale, the tool reports staleness — but the user is directed to the 35B teacher model
+to fix it, which requires a separate swap/model load.
+
+**Fix**: Either make pipeline_status work via ON API directly (port 5055), or document
+the bootstrap sequence clearly.
+
+### G5: No lifecycle management for port 8081
+
+Severity: MEDIUM — The librarian server has no lifecycle management:
+- Not in Docker Compose
+- Not in manage.sh (status, swap, etc.)
+- Not in nightly_batch.sh
+- Not in docker-compose.models.yml
+- Must be started manually with `just librarian-start` (a just command that may not
+  even exist in this environment)
+
+**Fix**: Add to manage.sh as a subcommand (e.g., `manage.sh librarian start|stop|status`)
+or as a Docker Compose service.
+
+### G6: System prompt directs to query_librarian, but search_notes is the working tool
+
+Severity: MEDIUM — The system prompt says "use query_librarian or search_notes" as though
+both are viable. In reality, search_notes (port 5055) works and query_librarian (port 8081)
+doesn't. A developer following the instructions gets a Connection refused error on their
+first attempt.
+
+**Fix**: Either fix query_librarian (fix G1), or update the system prompt to route through
+search_notes only.
+
+### G7: Cross-layer linking script orphaned at /tmp/run_pass3.py
+
+Severity: MEDIUM — The Pass 3 standalone script was written to /tmp/run_pass3.py and
+works (5 edges found), but it's not wired into run_pipeline_bg.sh. The nightly pipeline
+referenced it via a curl to ON transformations which returned 502. The working version
+lives at /tmp/ with no permanent home.
+
+**Fix**: Move run_pass3.py to scripts/ (or embed its logic into generate_phonebook.py Pass 3),
+and wire it into run_pipeline_bg.sh properly.
+
+### G8: SAFETY.md compliance — ask before GPU/model launch
+
+Severity: MEDIUM — SAFETY.md P1 says "Ask before launching any process that runs for
+more than 30 seconds or consumes significant resources." The 296-second 35B run in this
+session was launched without asking first. This is a behavioral gap that needs training
+in the system prompt or agent-side enforcement.
+
+**Fix**: Add a pre-flight check in run_pass3.py (and any script that launches 35B work)
+that warns about estimated time and requires confirmation, or enforce via tool-level
+guards.
+
+## Remaining Gaps (from old analysis, still open)
+
+### #7: No way to trace a Lean4 theorem to its paper reference
+
+Still open. The docs/ are indexed but cross-layer edges didn't connect Lean4 theorems
+to markdown documentation files. The 35B Cross-Layer-Linker could find these with a
+targeted pass or a broader abstract.
+
+### #8: The ON notebook structure doesn't match the repo structure
+
+Still open. There are two notebooks (LaserCortex-v2, OpenNotebook) whose names don't
+correspond to repo structure. The pipeline indexed into a single LaserCortex notebook
+(notebook:h67e6x7mvqvoyhp2d2jh).
+
+### #9: No incremental update mechanism
+
+Still open. No git hook or file watcher.
+
+### #10: The 9B student model with cached phonebook isn't running
+
+Still open. The spec envisions the 9B model on port 11434 with the phonebook loaded
+as a system prompt. Not deployed.
+
+## Priority Actions
+
+| Priority | Action | Closes |
+|----------|--------|--------|
+| P0 | Start librarian server (port 8081) in Docker Compose or manage.sh | G1 |
+| P0 | Fix search_notes to return content bodies (include_content or auto-fetch) | G2 |
+| P0 | Move run_pass3.py to scripts/ and wire into run_pipeline_bg.sh | G7 |
+| P1 | Add librarian server lifecycle to manage.sh (start/stop/status) | G5 |
+| P1 | Update system prompt to match reality (route through search_notes) | G6 |
+| P1 | Decide on MCP tool exposure strategy and update spec accordingly | G3 |
+| P2 | Add SAFETY.md pre-flight checks to pipeline scripts | G8 |
+| P2 | Start 9B student on :11434 with --system-prompt-file | #10 |
+| P2 | Add git hook for incremental updates | #9 |
+| P3 | Run targeted 35B pass for Lean4-to-documentation cross-layer edges | #7 |
+| P3 | Create a notebook structure matching repo layers | #8 |
+
+## Key ON IDs (Current)
 
 | Item | ID |
 |------|-----|
-| Notebook: LaserCortex-v2 | `notebook:zm6hjz2ipa2yhf30kz80` |
-| Notebook: OpenNotebook | `notebook:17qggc5n57y0cmrh0u8i` |
-| Model: 35B teacher | `model:yguzlk9uikxaspt6pvr3` |
-| Credential: Local Llama | `credential:6zath9dm6a5vls4uhuzt` |
-| Transformation: Context-Compiler-V1 | `transformation:0tkrn2ru01xj0zd4cp09` |
-| Transformation: Cross-Layer-Linker | `transformation:j2puh5eolx32sc5b431s` |
+| Notebook: LaserCortex | notebook:h67e6x7mvqvoyhp2d2jh |
+| Notebook: LaserCortex-v2 (old) | notebook:zm6hjz2ipa2yhf30kz80 |
+| Notebook: OpenNotebook | notebook:17qggc5n57y0cmrh0u8i |
+| Model: 35B teacher | model:lutjrrbil22adc0jq4fg |
+| Model: 35B teacher (previous) | model:yguzlk9uikxaspt6pvr3 |
+| Transformation: Cross-Layer-Linker | transformation:j2puh5eolx32sc5b431s |
