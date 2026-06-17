@@ -1,0 +1,115 @@
+# llama.cpp model servers — Docker Compose
+#
+# Only ONE model runs at a time (they share the same GPU).
+# Bind-mounts the model directory read-only — NO file copies.
+# All args that were passed to llama-server directly are passed here.
+#
+# Usage:
+#   docker compose up -d model-9b          # start 9B for daytime chat
+#   docker compose stop model-9b           # stop it
+#   docker compose up -d model-35b         # start 35B (stop 9B first)
+#   ./manage.sh swap 9b|35b                # preferred: preloads + starts
+#
+# Pre-flight (before first start):
+#   ./manage.sh preload                    # vmtouch 35B into page cache
+#
+# Performance notes:
+#   1. CUDA kernel cache volume (~/.nv/ComputeCache → /cuda-cache) avoids
+#      recompiling kernels on restart. Cache is ~69 MB after first load.
+#   2. vmtouch -t the 35B GGUF before starting (manage.sh does this).
+#      Loads 14-17G of the 21G model into kernel page cache (SATA SSD ~100s).
+#   3. Combinations:
+#      - First start (no caches): ~7 min (CUDA compile + model load)
+#      - With CUDA cache: ~45-150s (model load + tensor setup)
+#      - With vmtouch + CUDA cache: ~45-90s (fewer page faults)
+
+name: llocollama
+
+x-base: &base
+  image: ghcr.io/ggml-org/llama.cpp:server-cuda
+  restart: unless-stopped
+  # GPU access via CDI (no runtime config needed on modern Docker)
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+  environment:
+    - NVIDIA_VISIBLE_DEVICES=all
+    - CUDA_VISIBLE_DEVICES=0
+    - CUDA_CACHE_PATH=/cuda-cache  # persist compiled kernels across restarts
+  volumes:
+    # Bind mount — NO copy. Container reads directly from host path.
+    - /run/media/nos/games/models:/models:ro
+    # KV-cache persists across restarts (Docker-managed volume)
+    - cache-data:/cache
+    # CUDA kernel cache — 6-min init happens ONCE, subsequent starts in seconds
+    - ${HOME}/.nv/ComputeCache:/cuda-cache
+  ulimits:
+    memlock: -1
+    stack: 1073741824
+
+services:
+  # ---- 9B Student (daytime chat) ----
+  model-9b:
+    <<: *base
+    ports:
+      - "11434:8080"   # host:11434 → container:8080
+    entrypoint: ["/app/llama-server"]
+    command:
+      - --model
+      - /models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+      - --flash-attn
+      - "on"
+      - --no-jinja
+      - --ctx-size
+      - "65536"
+      - --cache-type-k
+      - q4_0
+      - --cache-type-v
+      - q4_0
+      - --cache-ram
+      - "8192"
+      - --parallel
+      - "2"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --cache-prompt
+
+  # ---- 35B Teacher (nightly transforms) ----
+  model-35b:
+    <<: *base
+    ports:
+      - "8080:8080"    # host:8080 → container:8080
+    entrypoint: ["/app/llama-server"]
+    command:
+      - --model
+      - /models/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf
+      - --flash-attn
+      - "on"
+      - --jinja
+      - --chat-template-kwargs
+      - '{"preserve_thinking":true}'
+      - --ctx-size
+      - "65536"
+      - --cache-type-k
+      - q4_0
+      - --cache-type-v
+      - q4_0
+      - --cache-ram
+      - "8192"
+      - --parallel
+      - "1"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --cache-prompt
+
+volumes:
+  cache-data:
+    driver: local

@@ -487,10 +487,10 @@ def code_report(fpath: Path, text: str) -> str:
 
     # ── Assemble report ────────────────────────────────────────────────
     parts: list[str] = []
+    seen_names: set[str] = set()  # may be referenced below even if definitions is empty
 
     if definitions:
         # Deduplicate by *name* (first occurrence wins)
-        seen_names: set[str] = set()
         unique_defs: list[str] = []
         for d in definitions:
             # d is "kind:name" (most) or just "name" (decorator fallback)

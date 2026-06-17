@@ -17,11 +17,13 @@ import argparse
 import time
 import hashlib
 import uuid
+import threading
 from typing import Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
+import torch  # for cuda.empty_cache() on GPU
 
 app = FastAPI(title="Embedding Server")
 
@@ -29,6 +31,7 @@ _model = None
 _model_name: str = ""
 _dim: int = 0
 _device: str = "cpu"
+_encode_lock = threading.Lock()  # serialize GPU encode calls to avoid OOM
 
 
 class EmbeddingRequest(BaseModel):
@@ -68,7 +71,10 @@ def create_embeddings(req: EmbeddingRequest):
 
     texts = req.input if isinstance(req.input, list) else [req.input]
     t0 = time.time()
-    embeddings = _model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    with _encode_lock:
+        embeddings = _model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        if _device == "cuda":
+            torch.cuda.empty_cache()
     elapsed = time.time() - t0
 
     data = []
