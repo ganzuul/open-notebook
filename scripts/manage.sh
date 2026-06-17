@@ -44,6 +44,9 @@ RANKER="$PIPELINE_DIR/rank_by_relevance.py"
 RANKING_FILE="/tmp/lasercortex_ranking.json"
 REPO_ROOT="/home/nos/labware/LaserCortex"
 EMBED_SCRIPT="$REPO_ROOT/scripts/start_embed_server.sh"
+LIBRARIAN_SCRIPT="$PIPELINE_DIR/librarian_server.py"
+LIBRARIAN_PIDFILE="/tmp/lasercortex-librarian.pid"
+LIBRARIAN_PORT=8081
 
 # Docker Compose file for model containers (relative to script dir)
 COMPOSE_FILE="docker-compose.models.yml"
@@ -133,6 +136,16 @@ except: pass" 2>/dev/null | grep -q "running"; then
     done
 
     echo ""
+    echo ""
+    echo "=== Librarian Index Server ==="
+    if [ -f "$LIBRARIAN_PIDFILE" ] && kill -0 "$(cat "$LIBRARIAN_PIDFILE")" 2>/dev/null; then
+        echo "  Running on :$LIBRARIAN_PORT (PID $(cat "$LIBRARIAN_PIDFILE"))"
+    elif curl -sf "http://localhost:$LIBRARIAN_PORT/modules" > /dev/null 2>&1; then
+        echo "  Running on :$LIBRARIAN_PORT (responsive, no PID file)"
+    else
+        echo "  STOPPED"
+    fi
+
     echo "=== Page Cache ==="
     vmtouch "$MODEL_35B" 2>/dev/null | grep -E "Resident|Pages| percentage" || echo "  (not cached)"
     echo ""
@@ -478,14 +491,86 @@ case "${1:-help}" in
     logs)
         docker compose logs -f --tail=50 "${2:-}" 2>/dev/null || docker compose logs --tail=50 "${2:-}"
         ;;
+    librarian)
+        # Manage the librarian index server (FastAPI on :8081).
+        action="${2:-status}"
+        shift 2 2>/dev/null || shift
+        case "$action" in
+            start)
+                if [ -f "$LIBRARIAN_PIDFILE" ] && kill -0 "$(cat "$LIBRARIAN_PIDFILE")" 2>/dev/null; then
+                    log "Librarian server already running (PID $(cat "$LIBRARIAN_PIDFILE"))"
+                    exit 0
+                fi
+                [ -f "$LIBRARIAN_SCRIPT" ] || err "Librarian script not found: $LIBRARIAN_SCRIPT"
+                log "Starting librarian index server on :$LIBRARIAN_PORT..."
+                nohup python3 -m uvicorn librarian_server:app \
+                    --host 0.0.0.0 --port "$LIBRARIAN_PORT" \
+                    --app-dir "$PIPELINE_DIR" \
+                    --log-level info \
+                    > /tmp/lasercortex-librarian.log 2>&1 &
+                echo $! > "$LIBRARIAN_PIDFILE"
+                # Wait for it to be ready
+                for i in $(seq 1 10); do
+                    if curl -sf "http://localhost:$LIBRARIAN_PORT/modules" > /dev/null 2>&1; then
+                        log "Librarian server ready on :$LIBRARIAN_PORT"
+                        break
+                    fi
+                    sleep 1
+                done
+                ;;
+            stop)
+                if [ -f "$LIBRARIAN_PIDFILE" ]; then
+                    PID=$(cat "$LIBRARIAN_PIDFILE")
+                    log "Stopping librarian server (PID $PID)..."
+                    kill "$PID" 2>/dev/null || true
+                    sleep 1
+                    kill -0 "$PID" 2>/dev/null && kill -9 "$PID" 2>/dev/null || true
+                    rm -f "$LIBRARIAN_PIDFILE"
+                    log "Stopped"
+                else
+                    # Try to find and kill by port
+                    PID=$(lsof -ti :$LIBRARIAN_PORT 2>/dev/null || true)
+                    if [ -n "$PID" ]; then
+                        log "Stopping librarian server on port :$LIBRARIAN_PORT (PID $PID)..."
+                        kill "$PID" 2>/dev/null || true
+                        log "Stopped"
+                    else
+                        log "Librarian server not running"
+                    fi
+                fi
+                ;;
+            status)
+                if [ -f "$LIBRARIAN_PIDFILE" ] && kill -0 "$(cat "$LIBRARIAN_PIDFILE")" 2>/dev/null; then
+                    echo "Running on :$LIBRARIAN_PORT (PID $(cat "$LIBRARIAN_PIDFILE"))"
+                elif lsof -ti :$LIBRARIAN_PORT > /dev/null 2>&1; then
+                    echo "Running on :$LIBRARIAN_PORT (PID $(lsof -ti :$LIBRARIAN_PORT))"
+                else
+                    echo "Not running"
+                fi
+                ;;
+            restart)
+                log "Restarting librarian server..."
+                "$0" librarian stop
+                sleep 1
+                "$0" librarian start
+                ;;
+            logs)
+                tail -30 /tmp/lasercortex-librarian.log 2>/dev/null || echo "No log file found"
+                ;;
+            *)
+                err "Usage: $0 librarian {start|stop|status|restart|logs}"
+                ;;
+        esac
+        ;;
     *)
-        echo "Usage: $0 {status|swap|rank|embed|unload|preload|bake-cache|logs}"
+        echo "Usage: $0 {status|swap|rank|embed|unload|preload|bake-cache|librarian|logs}"
         echo ""
-        echo "  status                           — model states, page cache, VRAM"
+        echo "  status                           — model states, page cache, VRAM, librarian"
         echo "  swap 9b                          — stop 35B, start 9B (fast)"
         echo "  swap 35b [--query \"...\"]        — vmtouch + rank in parallel, then start 35B"
         echo "  rank [--query \"...\"]            — standalone relevance ranking (no model swap)"
         echo "  embed cpu|gpu|stop|status        — manage bge-m3 embedding server on :8082"
+        echo "  librarian start|stop|status      — manage librarian index server on :8081"
         echo "  unload [9b|35b]                  — stop a model (default: both)"
         echo "  preload                          — vmtouch 35B into page cache only"
         echo "  bake-cache 9b|35b                — instructions for KV-cache pre-baking"
