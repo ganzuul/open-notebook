@@ -335,9 +335,18 @@ def doc_report(text: str) -> str:
 def code_report(fpath: Path, text: str) -> str:
     """Build a structured report for a code file using Pygments tokenization.
 
-    Extracts definition names (what is *defined* here), language keywords,
-    interesting identifiers, and docstring comments.  Formats as a
-    natural-language-style report for the embedding model.
+    Groups extracted data into labelled sections so the embedding model sees
+    *what kind* of thing each token is::
+
+        DEFINES: theorem:add_comm def:double struct:Point inductive:Tree
+        DEF.KW: theorem def structure inductive
+        KW: import open
+        NAMES: Nat Type
+        DOC: module docstring ...
+
+    Design principle: emit useful data first (with kind labels), *then*
+    filter.  Downstream steps can strip low-value sections without losing the
+    kind information.
     """
     from pygments.lexers import get_lexer_for_filename
     from pygments.token import Token
@@ -349,104 +358,169 @@ def code_report(fpath: Path, text: str) -> str:
 
     tokens = list(lexer.get_tokens(text))
 
-    keywords: list[str] = []
-    names: set[str] = set()
-    definitions: list[str] = []
-    comments: list[str] = []
+    # ── Accumulators ───────────────────────────────────────────────────
+    definitions: list[str] = []       # "theorem:add_comm", "def:double", …
+    def_intro_kw: list[str] = []      # keywords that *introduce* definitions
+    other_kw: list[str] = []          # non-boilerplate keywords (import, open, …)
+    referenced: set[str] = set()      # identifiers used but not defined here
+    comments: list[str] = []          # meaningful docstrings / comments
 
-    # Track whether the previous keyword signals a definition coming next
-    expecting_def = False
+    # Boilerplate keywords that appear in virtually every code file and
+    # carry no discriminative power for ranking.  Dropped immediately.
+    BOILERPLATE_KW = frozenset({
+        'by', 'have', 'using', 'with', 'calc', 'at', 'if', 'then',
+        'else', 'let', 'in', 'end', 'do', 'done', 'match', 'case',
+        'of', 'as', 'where', 'when', 'from',
+        'return', 'try', 'catch', 'finally',
+    })
+
+    # Keywords that introduce a definition — the *next* Name token is the
+    # name of the thing being defined.
+    # Keywords that introduce a top-level definition — the *next* Name
+    # token is the name of the thing being defined.
+    #
+    # NOTE: `fun` / `fn` / `function` are *not* included because:
+    #   - In Lean they are lambda binders, not definitions
+    #   - In Rust / TS / Python, Pygments already classifies the
+    #     following name as Name.Function, so the tracker is redundant.
+    DEF_INTRO = frozenset({
+        'def', 'theorem', 'lemma',
+        'corollary', 'proposition', 'example',
+        'class', 'structure', 'inductive', 'record',
+        'enum', 'trait', 'interface', 'type', 'instance',
+        'sub', 'macro',
+    })
+
+    # Some lexers misclassify certain definition-introducing keywords as
+    # Token.Name (e.g. Lean's abbreviated ``struct`` keyword is Name not
+    # Keyword).  We check these separately after the main Keyword filter.
+    NAME_AS_DEF_INTRO = frozenset({
+        'struct',
+    })
+
+    # Short labels for DEF_INTRO keywords.
+    KIND_LABEL = {
+        'def': 'def',
+        'theorem': 'theorem', 'lemma': 'lemma',
+        'corollary': 'corollary', 'proposition': 'proposition',
+        'example': 'example',
+        'class': 'class', 'structure': 'struct', 'struct': 'struct',
+        'inductive': 'inductive', 'record': 'record',
+        'enum': 'enum', 'trait': 'trait', 'interface': 'interface',
+        'type': 'type', 'instance': 'instance',
+        'sub': 'sub', 'macro': 'macro',
+    }
+
+    expecting_kind: str | None = None  # e.g. "theorem" when we just saw `theorem`
 
     for ttype, value in tokens:
         v = value.strip()
 
-        # Skip pure whitespace — don't reset expecting_def
+        # Pure whitespace — never resets expecting_kind
         if not v:
-            if ttype in Token.Text or ttype in Token.Whitespace:
+            if ttype is Token.Text.Whitespace or ttype in Token.Text:
                 continue
-            expecting_def = False
+            expecting_kind = None
             continue
 
-        # If expecting a definition name (after `def`, `theorem`, `class`, `struct`, etc.)
-        if expecting_def and ttype in Token.Name:
-            definitions.append(v)
-            expecting_def = False
+        # ── Definition name following a def-introducing keyword ─────────
+        if expecting_kind is not None and ttype in (Token.Name, Token.Name.Other):
+            definitions.append(f"{expecting_kind}:{v}")
+            expecting_kind = None
             continue
 
+        # ── Keywords ────────────────────────────────────────────────────
         if ttype in Token.Keyword:
             kw = v
-            keywords.append(kw)
-            # These keywords introduce a definition in most languages
-            if kw in {
-                'def', 'fn', 'fun', 'function', 'theorem', 'lemma',
-                'corollary', 'proposition', 'example',
-                'class', 'struct', 'structure', 'inductive', 'record',
-                'enum', 'trait', 'interface', 'type', 'instance',
-                'let', 'var', 'val', 'const', 'function',
-                'sub', 'macro',
-            }:
-                expecting_def = True
+            if kw in DEF_INTRO:
+                expecting_kind = KIND_LABEL.get(kw, kw)
+                def_intro_kw.append(kw)
+            elif kw not in BOILERPLATE_KW:
+                other_kw.append(kw)
+            # BOILERPLATE_KW keywords are silently dropped
             continue
 
-        # Name tokens that carry definition information based on token type
-        if ttype in Token.Name.Function:
-            definitions.append(v)
-        elif ttype in Token.Name.Class:
-            definitions.append(v)
-        elif ttype in Token.Name.Decorator:
-            deco = v.lstrip('@')
-            definitions.append(deco)
-        # Only add to names set it it's not already captured as a definition
-        elif ttype in Token.Name:
-            if len(v) > 3 or (v[0].isupper() and len(v) > 1):
-                names.add(v)
+        # ── Names that act as definition keywords ───────────────────────
+        # Some lexers misclassify certain def-intro keywords as Token.Name
+        # (e.g. Lean's ``struct`` appears as Name, not Keyword).
+        if ttype in Token.Name and v in NAME_AS_DEF_INTRO:
+            expecting_kind = KIND_LABEL.get(v, v)
+            def_intro_kw.append(v)
+            continue
 
+        # ── Names classified by Pygments token type ─────────────────────
+        if ttype in Token.Name.Function:
+            definitions.append(f"fn:{v}")
+        elif ttype in Token.Name.Class:
+            definitions.append(f"class:{v}")
+        elif ttype in Token.Name.Decorator:
+            definitions.append(f"decorator:{v.lstrip('@')}")
+        elif ttype in Token.Name:
+            # Skip pseudo-names (operators like `+`, `.`, `=`, `=>`) that
+            # some lexers (notably Lean4) misclassify as Name.Builtin.Pseudo.
+            if ttype in Token.Name.Builtin.Pseudo:
+                pass
+            # Drop only single-letter variables (a, b, h, x, …) — they are
+            # universally uninformative across all languages.  Keep short
+            # meaningful identifiers like `map`, `go`, `id`, `any`, `rec`.
+            elif len(v) == 1:
+                pass
+            else:
+                referenced.add(v)
+
+        # ── Preprocessor directives (#include, #import, …) ─────────────
         elif ttype in Token.Comment.Preproc:
-            keywords.append(v)
+            other_kw.append(v)
+
+        # ── Comments ───────────────────────────────────────────────────
         elif ttype in Token.Comment:
             clean = v.strip()
-            if clean:
+            # Skip single-line dashes ("-- file header") and shebangs
+            if clean and not clean.startswith('-') and not clean.startswith('#'):
                 comments.append(clean)
 
-        # Reset definition expectation for any non-Name token that isn't
-        # a definition-introducing keyword (e.g. punctuation, operators)
+        # Reset expecting_kind for punctuation / operators / anything
+        # that isn't a name or a def-intro keyword
         if not (ttype in Token.Name or ttype in Token.Whitespace or ttype in Token.Text):
-            if not (ttype in Token.Keyword and v in {
-                'def', 'fn', 'fun', 'function', 'theorem', 'lemma',
-                'corollary', 'proposition', 'example',
-                'class', 'struct', 'structure', 'inductive', 'record',
-                'enum', 'trait', 'interface', 'type', 'instance',
-                'let', 'var', 'val', 'const', 'function',
-                'sub', 'macro',
-            }):
-                expecting_def = False
+            if not (ttype in Token.Keyword and v in DEF_INTRO):
+                expecting_kind = None
 
-    # Build report
+    # ── Assemble report ────────────────────────────────────────────────
     parts: list[str] = []
+
     if definitions:
-        # Deduplicate while preserving order
-        seen: set[str] = set()
-        unique_defs = [d for d in definitions if not (d in seen or seen.add(d))]
-        parts.append(f"DEFINES: {' '.join(unique_defs[:25])}")
-    if keywords:
-        # Deduplicate
+        # Deduplicate by *name* (first occurrence wins)
+        seen_names: set[str] = set()
+        unique_defs: list[str] = []
+        for d in definitions:
+            # d is "kind:name" (most) or just "name" (decorator fallback)
+            if ':' in d:
+                _kind, _name = d.split(':', 1)
+            else:
+                _kind, _name = '', d
+            if _name not in seen_names:
+                seen_names.add(_name)
+                unique_defs.append(d)
+        parts.append(f"DEFINES: {' '.join(unique_defs[:30])}")
+
+    if def_intro_kw:
         seen_kw: set[str] = set()
-        unique_kw = [k for k in keywords if not (k in seen_kw or seen_kw.add(k))]
-        parts.append(f"KW: {' '.join(unique_kw[:25])}")
-    if names:
-        sorted_names = sorted(n for n in names if n not in definitions)
-        if sorted_names:
-            parts.append(f"NAMES: {' '.join(sorted_names[:15])}")
+        unique_dk = [k for k in def_intro_kw if not (k in seen_kw or seen_kw.add(k))]
+        parts.append(f"DEF.KW: {' '.join(unique_dk[:15])}")
+
+    if other_kw:
+        seen_kw2: set[str] = set()
+        unique_ok = [k for k in other_kw if not (k in seen_kw2 or seen_kw2.add(k))]
+        parts.append(f"KW: {' '.join(unique_ok[:15])}")
+
+    if referenced:
+        # Exclude names that were already captured as definitions
+        sorted_ref = sorted(n for n in referenced if n not in seen_names)
+        if sorted_ref:
+            parts.append(f"NAMES: {' '.join(sorted_ref[:15])}")
+
     if comments:
-        # Take the first few, truncate each to 150 chars
-        short_comments = []
-        for c in comments:
-            # Skip empty/shebang/pragma comments
-            if c.startswith('#'):
-                continue
-            short_comments.append(c[:150])
-        if short_comments:
-            parts.append(f"DOC: {' '.join(short_comments[:3])}")
+        parts.append(f"DOC: {' '.join(c[:150] for c in comments[:3])}")
 
     report = " | ".join(parts)
     if len(report) > PREVIEW_CHARS:
