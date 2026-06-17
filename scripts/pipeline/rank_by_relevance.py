@@ -2,19 +2,27 @@
 """
 rank_by_relevance.py — Rank source files by relevance to a research query.
 
-Embeds a preview of each file (path + first N chars of content) via bge-m3,
-then ranks by cosine similarity against the query embedding. Runs parallel
-requests to the embedding server for speed.
+Builds a *representative report* for each file (not just raw text), then
+embeds it via bge-m3 and ranks by cosine similarity against the query
+embedding.  Runs parallel requests to the embedding server for speed.
+
+The report pipeline replaces "first N chars" with language-aware extraction:
+  - Code files (Lean, Python, TS/JS, …)  → Pygments token analysis:
+    definition names (theorems, defs, classes), keywords, identifiers,
+    docstring comments.
+  - Doc files (Markdown, RST, …)          → keyword-frequency + heuristic
+    noun extraction + technical term capture (CamelCase, snake_case).
+  - Other / data files                     → raw first-N-char fallback.
 
 Outputs JSON with full rankings and top-K cutoff for the 35B teacher pass.
 
 Flow:
-  1. Walk repo (same exclusions as generate_phonebook.py).
-  2. Build "path | content-preview" for each file.
-  3. Embed query + all previews via bge-m3 (parallel batches).
-  4. Rank by cosine similarity.
-  5. Compute top-K from time budget.
-  6. Write JSON to stdout (or --output).
+   1. Walk repo (same exclusions as generate_phonebook.py).
+   2. Build representative report for each file via ``make_preview()``.
+   3. Embed query + all reports via bge-m3 (parallel batches).
+   4. Rank by cosine similarity.
+   5. Compute top-K from time budget.
+   6. Write JSON to stdout (or --output).
 
 Typical time: ~2-3 min for 1400 files with 6 parallel workers.
 """
@@ -24,6 +32,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,7 +45,7 @@ EMBED_URL = "http://localhost:8082/v1/embeddings"
 EMBED_MODEL = "bge-m3"
 BATCH_SIZE = 50            # items per API call
 NUM_WORKERS = 6            # parallel requests (system has 24 CPU cores)
-PREVIEW_CHARS = 500        # chars of each file's content to embed (first line + ...
+PREVIEW_CHARS = 3000       # chars of each file's content to embed (fallback for unsupported types)
 SEC_PER_FILE = 75          # estimated 35B transformation time per file
 DEFAULT_TIME_BUDGET = 3 * 3600  # 3 hours
 MIN_TOP_K = 1
@@ -195,19 +204,285 @@ def resolve_included_paths(root: Path, paths: list[str]) -> list[Path]:
     return sorted(deduped)
 
 
-def make_preview(fpath: Path) -> str | None:
-    """Build 'path | content-preview' string. Returns None for binaries or unreadable."""
+# ── File classification ─────────────────────────────────────────────────────
+# Which extensions get the Pygments code report vs. the keyword/doc report.
+CODE_EXTENSIONS = {".lean", ".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".go",
+                   ".sh", ".bash", ".c", ".cpp", ".h", ".hpp", ".java", ".kt",
+                   ".scala", ".sml", ".rkt", ".clj", ".rb", ".php"}
+
+DOC_EXTENSIONS = {".md", ".txt", ".rst", ".tex", ".org"}
+
+# General English stop words for keyword extraction
+STOP_WORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "is", "are", "was", "were", "be", "been", "has", "have", "had",
+    "do", "does", "did", "will", "would", "shall", "should", "may", "might",
+    "must", "can", "could", "with", "without", "by", "from", "as", "at",
+    "into", "through", "during", "before", "after", "above", "below",
+    "between", "this", "that", "these", "those", "it", "its", "his", "her",
+    "their", "our", "your", "my", "itself", "himself", "herself", "its",
+    "who", "which", "what", "whom", "whose", "not", "no", "nor", "so",
+    "if", "then", "else", "when", "where", "why", "how", "all", "each",
+    "every", "both", "few", "many", "several", "some", "any", "more",
+    "most", "other", "such", "only", "own", "same", "too", "very",
+    "just", "also", "than", "about", "up", "out", "off", "over", "under",
+    "again", "further", "once", "here", "there",
+}
+
+
+# ── Keyword / noun extraction helpers (no external NLP) ─────────────────────
+
+
+def extract_technical_terms(text: str) -> list[str]:
+    """Extract CamelCase, snake_case, and UPPER_CASE technical terms."""
+    terms: set[str] = set()
+    for m in re.finditer(r'\b[A-Z][a-z]+[A-Z][A-Za-z0-9]*\b', text):
+        terms.add(m.group())
+    for m in re.finditer(r'\b[a-z]+_[a-z_0-9]+\b', text):
+        terms.add(m.group())
+    for m in re.finditer(r'\b[A-Z][A-Z0-9_]+\b', text):
+        if len(m.group()) > 2:
+            terms.add(m.group())
+    return sorted(terms)
+
+
+def extract_important_keywords(text: str, top_n: int = 25) -> list[str]:
+    """Extract top-N keywords by frequency (stop-filtered, 4+ chars)."""
+    from collections import Counter
+    words = re.findall(r'[a-zA-Z]\w{3,}', text.lower())
+    freq = Counter(w for w in words if w not in STOP_WORDS)
+    return [w for w, _ in freq.most_common(top_n)]
+
+
+def extract_nouns_heuristic(text: str) -> list[str]:
+    """Heuristic noun extraction without POS tagging.
+
+    Looks for words after determiners and words before copular verbs,
+    which are strong noun-position signals in English prose.
+    """
+    nouns: set[str] = set()
+    # Words after determiners like "the X", "this X", "each X" where X ≥ 4 chars
+    for m in re.finditer(
+        r'\b(the|a|an|this|that|these|those|each|every|some|any|no|many|'
+        r'several|both|such|what|which)\s+(\w{4,})\b',
+        text, re.IGNORECASE,
+    ):
+        w = m.group(2)
+        if not w[0].isupper() and not w[0].isdigit():
+            nouns.add(w.lower())
+    # Words before copular verbs: "X is/are/was/were", "X has/have/had"
+    for m in re.finditer(r'(\w{4,})\s+(is|are|was|were|has|have|had)\b',
+                         text, re.IGNORECASE):
+        w = m.group(1)
+        if w[0].islower():
+            nouns.add(w.lower())
+    return sorted(nouns)[:10]
+
+
+# ── Doc file report ─────────────────────────────────────────────────────────
+
+
+def doc_report(text: str) -> str:
+    """Build a representative keyword-and-structure report for a documentation file.
+
+    Extracts headings, technical terms (CamelCase / snake_case), important
+    keywords, and heuristic nouns — all without external NLP libraries.
+    """
+    lines = text.split('\n')
+
+    # Structrue: headings
+    headings = [
+        line.strip().lstrip('#').strip()
+        for line in lines
+        if line.strip().startswith('#')
+    ]
+
+    # Inline code / backtick terms
+    code_terms = re.findall(r'`([^`]+)`', text)
+
+    # Technical terms
+    technical = extract_technical_terms(text)
+
+    # Top keywords by frequency
+    keywords = extract_important_keywords(text, top_n=25)
+
+    # Noun-like words
+    nouns = extract_nouns_heuristic(text)
+
+    parts: list[str] = []
+    if headings:
+        # Truncate each heading to first 4 words
+        short = [' '.join(h.split()[:4]) for h in headings[:6]]
+        parts.append(f"H: {' / '.join(short)}")
+    if code_terms:
+        parts.append(f"CODE: {' '.join(code_terms[:8])}")
+    if technical:
+        parts.append(f"TERMS: {' '.join(technical[:10])}")
+    if keywords:
+        parts.append(f"KW: {' '.join(keywords[:20])}")
+    if nouns:
+        parts.append(f"NOUNS: {' '.join(nouns[:8])}")
+
+    report = " | ".join(parts)
+    if len(report) > PREVIEW_CHARS:
+        report = report[:PREVIEW_CHARS - 3] + "..."
+    return report if report else text[:PREVIEW_CHARS]
+
+
+# ── Code file report (Pygments) ──────────────────────────────────────────────
+
+
+def code_report(fpath: Path, text: str) -> str:
+    """Build a structured report for a code file using Pygments tokenization.
+
+    Extracts definition names (what is *defined* here), language keywords,
+    interesting identifiers, and docstring comments.  Formats as a
+    natural-language-style report for the embedding model.
+    """
+    from pygments.lexers import get_lexer_for_filename
+    from pygments.token import Token
+
     try:
-        raw = fpath.read_bytes()[:PREVIEW_CHARS + 1]
+        lexer = get_lexer_for_filename(str(fpath))
+    except Exception:
+        return text[:PREVIEW_CHARS]  # fallback
+
+    tokens = list(lexer.get_tokens(text))
+
+    keywords: list[str] = []
+    names: set[str] = set()
+    definitions: list[str] = []
+    comments: list[str] = []
+
+    # Track whether the previous keyword signals a definition coming next
+    expecting_def = False
+
+    for ttype, value in tokens:
+        v = value.strip()
+
+        # Skip pure whitespace — don't reset expecting_def
+        if not v:
+            if ttype in Token.Text or ttype in Token.Whitespace:
+                continue
+            expecting_def = False
+            continue
+
+        # If expecting a definition name (after `def`, `theorem`, `class`, `struct`, etc.)
+        if expecting_def and ttype in Token.Name:
+            definitions.append(v)
+            expecting_def = False
+            continue
+
+        if ttype in Token.Keyword:
+            kw = v
+            keywords.append(kw)
+            # These keywords introduce a definition in most languages
+            if kw in {
+                'def', 'fn', 'fun', 'function', 'theorem', 'lemma',
+                'corollary', 'proposition', 'example',
+                'class', 'struct', 'structure', 'inductive', 'record',
+                'enum', 'trait', 'interface', 'type', 'instance',
+                'let', 'var', 'val', 'const', 'function',
+                'sub', 'macro',
+            }:
+                expecting_def = True
+            continue
+
+        # Name tokens that carry definition information based on token type
+        if ttype in Token.Name.Function:
+            definitions.append(v)
+        elif ttype in Token.Name.Class:
+            definitions.append(v)
+        elif ttype in Token.Name.Decorator:
+            deco = v.lstrip('@')
+            definitions.append(deco)
+        # Only add to names set it it's not already captured as a definition
+        elif ttype in Token.Name:
+            if len(v) > 3 or (v[0].isupper() and len(v) > 1):
+                names.add(v)
+
+        elif ttype in Token.Comment.Preproc:
+            keywords.append(v)
+        elif ttype in Token.Comment:
+            clean = v.strip()
+            if clean:
+                comments.append(clean)
+
+        # Reset definition expectation for any non-Name token that isn't
+        # a definition-introducing keyword (e.g. punctuation, operators)
+        if not (ttype in Token.Name or ttype in Token.Whitespace or ttype in Token.Text):
+            if not (ttype in Token.Keyword and v in {
+                'def', 'fn', 'fun', 'function', 'theorem', 'lemma',
+                'corollary', 'proposition', 'example',
+                'class', 'struct', 'structure', 'inductive', 'record',
+                'enum', 'trait', 'interface', 'type', 'instance',
+                'let', 'var', 'val', 'const', 'function',
+                'sub', 'macro',
+            }):
+                expecting_def = False
+
+    # Build report
+    parts: list[str] = []
+    if definitions:
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique_defs = [d for d in definitions if not (d in seen or seen.add(d))]
+        parts.append(f"DEFINES: {' '.join(unique_defs[:25])}")
+    if keywords:
+        # Deduplicate
+        seen_kw: set[str] = set()
+        unique_kw = [k for k in keywords if not (k in seen_kw or seen_kw.add(k))]
+        parts.append(f"KW: {' '.join(unique_kw[:25])}")
+    if names:
+        sorted_names = sorted(n for n in names if n not in definitions)
+        if sorted_names:
+            parts.append(f"NAMES: {' '.join(sorted_names[:15])}")
+    if comments:
+        # Take the first few, truncate each to 150 chars
+        short_comments = []
+        for c in comments:
+            # Skip empty/shebang/pragma comments
+            if c.startswith('#'):
+                continue
+            short_comments.append(c[:150])
+        if short_comments:
+            parts.append(f"DOC: {' '.join(short_comments[:3])}")
+
+    report = " | ".join(parts)
+    if len(report) > PREVIEW_CHARS:
+        report = report[:PREVIEW_CHARS - 3] + "..."
+    return report if report else text[:PREVIEW_CHARS]
+
+
+# ── Preview dispatcher ──────────────────────────────────────────────────────
+
+
+def make_preview(fpath: Path) -> str | None:
+    """Build a representative report for a file, suitable for embedding.
+
+    Dispatch rule:
+      - Code files → Pygments-based ``code_report()``
+      - Doc files → keyword/structure ``doc_report()``
+      - Other/text → raw first-3000-chars fallback
+      - Binary → None
+    """
+    try:
+        raw = fpath.read_bytes()
         if b'\0' in raw[:128]:
             return None  # binary
         text = raw.decode("utf-8", errors="replace")
-        # Get first PREVIEW_CHARS chars, strip leading blank lines
-        lines = text.split("\n")
-        content = "\n".join(l for l in lines if l.strip())[:PREVIEW_CHARS]
-        return content
     except (OSError, PermissionError):
         return None
+
+    ext = fpath.suffix.lower()
+
+    if ext in CODE_EXTENSIONS:
+        return code_report(fpath, text)
+    elif ext in DOC_EXTENSIONS:
+        return doc_report(text)
+    else:
+        # Data/config files and unknown: raw preview
+        return text[:PREVIEW_CHARS]
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -316,7 +591,7 @@ def main():
     print(f"  Total: {len(all_files)} source files", file=sys.stderr)
 
     # ── Build previews ─────────────────────────────────────────────────
-    print("Building file previews (path + first {} chars)...".format(PREVIEW_CHARS),
+    print("Building representative reports (code→Pygments, docs→keywords)...",
           file=sys.stderr)
     t0 = time.time()
     previews: list[tuple[Path, str]] = []
