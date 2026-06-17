@@ -45,6 +45,10 @@ RANKING_FILE="/tmp/lasercortex_ranking.json"
 REPO_ROOT="/home/nos/labware/LaserCortex"
 EMBED_SCRIPT="$REPO_ROOT/scripts/start_embed_server.sh"
 
+# Docker Compose file for model containers (relative to script dir)
+COMPOSE_FILE="docker-compose.models.yml"
+export COMPOSE_FILE
+
 # Default research query (used when none is provided via --query)
 # This should reflect the current research focus.
 RESEARCH_QUERY_DEFAULT="Lean4 formal verification of geometric theorems, Tamari lattice, and binary tree enumeration"
