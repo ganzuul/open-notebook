@@ -562,6 +562,119 @@ case "${1:-help}" in
                 ;;
         esac
         ;;
+    pipeline)
+        # Manage the 35B Deep Analysis pipeline as a background batch job.
+        # Starts 35B model if needed, runs generate_phonebook on outstanding
+        # files, then runs the Cross-Layer-Linker.
+        action="${2:-status}"
+        shift 2 2>/dev/null || shift
+        PIPELINE_SCRIPT="$REPO_ROOT/scripts/run_pipeline_bg.sh"
+        PIPELINE_LOGFILE="/tmp/lasercortex-pipeline-$(date +%Y%m%d).log"
+        case "$action" in
+            start)
+                # Parse --top-k from remaining args before doing anything else.
+                # (Can't use `local` outside a function in bash, so we use
+                #  the global namespace carefully.)
+                top_k=""
+                declare -a remaining=()
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        --top-k) top_k="$2"; shift 2 ;;
+                        --top-k=*) top_k="${1#*=}"; shift ;;
+                        *) remaining+=("$1"); shift ;;
+                    esac
+                done
+                set -- "${remaining[@]}"
+                unset remaining
+
+                # ── Ensure 35B model is running ──────────────────────
+                if ! curl -sf "http://localhost:$PORT_35B/v1/models" > /dev/null 2>&1; then
+                    log "35B not running — swapping now..."
+                    "$0" swap 35b
+                else
+                    log "35B already running on :$PORT_35B"
+                fi
+
+                # ── Ensure librarian server is running ───────────────
+                if ! curl -sf "http://localhost:$LIBRARIAN_PORT/modules" > /dev/null 2>&1; then
+                    log "Librarian server not running — starting..."
+                    "$0" librarian start
+                else
+                    log "Librarian server already running on :$LIBRARIAN_PORT"
+                fi
+
+                # ── Launch pipeline job ──────────────────────────────
+                log "Launching 35B pipeline in background..."
+                [ -x "$PIPELINE_SCRIPT" ] || err "Pipeline script not found: $PIPELINE_SCRIPT"
+
+                # Pass TOP_K through environment so run_pipeline_bg.sh picks it up
+                if [ -n "${top_k:-}" ]; then
+                    log "  TOP_K=$top_k (capped at $top_k files per run)"
+                    TOP_K="$top_k" "$PIPELINE_SCRIPT" start
+                else
+                    log "  TOP_K=unset (processing all remaining files)"
+                    "$PIPELINE_SCRIPT" start
+                fi
+
+                pid=""
+                [ -f "/tmp/lasercortex-pipeline.pid" ] && pid=$(cat "/tmp/lasercortex-pipeline.pid")
+                log "Pipeline job launched${pid:+ (PID $pid)}"
+                log "  Log: $PIPELINE_LOGFILE"
+                log "  Watch: $0 pipeline logs"
+                log "  Stop:  $0 pipeline kill"
+                ;;
+            status)
+                "$PIPELINE_SCRIPT" status 2>/dev/null || echo "Not running"
+                # Show how many files remain
+                if [ -f "$REPO_ROOT/.phonebook_cache.json" ]; then
+                    python3 -c "
+import json
+with open('$REPO_ROOT/.phonebook_cache.json') as f:
+    cache = json.load(f)
+total = len(cache)
+done = sum(1 for v in cache.values() if v.get('transform_sha'))
+remaining = total - done
+est_hours = remaining * 75 / 3600
+print(f'  35B Deep Analysis: {done}/{total} files ({remaining} remaining, ~{est_hours:.1f}h at 75s/file)')
+" 2>/dev/null || true
+                fi
+                ;;
+            logs)
+                "$PIPELINE_SCRIPT" logs 2>/dev/null || echo "No pipeline log yet"
+                ;;
+            kill)
+                log "Stopping pipeline job..."
+                "$PIPELINE_SCRIPT" kill
+                # Clean up the lockfile if it was left behind
+                rm -f /tmp/lasercortex-pipeline.lock
+                log "Stopped"
+                ;;
+            estimate)
+                # Show estimated time for remaining files
+                python3 -c "
+import json
+with open('$REPO_ROOT/.phonebook_cache.json') as f:
+    cache = json.load(f)
+total = len(cache)
+done = sum(1 for v in cache.values() if v.get('transform_sha'))
+remaining = total - done
+est_secs = remaining * 75
+est_hours = est_secs / 3600
+est_days = est_hours / 24
+print(f'Remaining: {remaining} files (out of {total})')
+print(f'Estimated: {est_secs}s = {est_hours:.1f}h = {est_days:.2f}d at 75s/file')
+print(f'With --top-k 144: 144 × 75s = {144*75}s = {144*75/3600:.1f}h per run')
+if remaining > 0:
+    runs_needed = (remaining + 143) // 144
+    print(f'Runs needed with --top-k: ~{runs_needed}')
+    print(f'Suggest: {remaining // 144} batches of --top-k 144, then 1 final run without cap')
+" 2>/dev/null || echo "Cannot read cache file"
+                ;;
+            *)
+                err "Usage: $0 pipeline {start|status|logs|kill|estimate}"
+                ;;
+        esac
+        ;;
     *)
         echo "Usage: $0 {status|swap|rank|embed|unload|preload|bake-cache|librarian|logs}"
         echo ""
@@ -573,6 +686,11 @@ case "${1:-help}" in
         echo "  librarian start|stop|status      — manage librarian index server on :8081"
         echo "  unload [9b|35b]                  — stop a model (default: both)"
         echo "  preload                          — vmtouch 35B into page cache only"
+        echo "  pipeline start [--top-k N]       — start 35B batch job (all files if no --top-k)"
+        echo "  pipeline status                  — check pipeline job + remaining files"
+        echo "  pipeline logs                    — tail pipeline log"
+        echo "  pipeline kill                    — stop pipeline gracefully"
+        echo "  pipeline estimate                — estimate time for remaining files"
         echo "  bake-cache 9b|35b                — instructions for KV-cache pre-baking"
         echo "  logs [svc]                       — tail logs"
         ;;
