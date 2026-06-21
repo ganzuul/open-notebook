@@ -33,6 +33,7 @@ from typing import Any
 import requests
 
 ON_URL = "http://localhost:5055/api"
+LLM_URL = "http://localhost:8080"  # Direct llama-server endpoint (bypass ON for determinism)
 
 # ---------------------------------------------------------------------------
 # Language support
@@ -170,18 +171,74 @@ class ONClient:
     def transformations_list(self) -> list:
         return self.get("/transformations")
 
+    # Cache for transformation prompts (fetched once from ON)
+    _prompt_cache: dict[str, str] = {}
+
+    def _get_transformation_prompt(self, transformation_id: str) -> str:
+        """Fetch the transformation prompt from ON (cached after first fetch)."""
+        if transformation_id not in self._prompt_cache:
+            try:
+                t = self.get(f"/transformations/{transformation_id}")
+                self._prompt_cache[transformation_id] = t.get("prompt", "")
+            except Exception as e:
+                print(f"  WARNING: Could not fetch prompt for {transformation_id}: {e}")
+                return ""
+        return self._prompt_cache[transformation_id]
+
     def transformation_execute(
         self, transformation_id: str, input_text: str, model_id: str
     ) -> dict:
-        return self.post(
-            "/transformations/execute",
-            data={
-                "transformation_id": transformation_id,
-                "input_text": input_text,
-                "model_id": model_id,
-            },
-            timeout=600,
-        )
+        """
+        Execute a transformation deterministically by calling the 35B directly
+        (bypassing ON's API which doesn't support temperature/seed control).
+
+        Uses:
+          - temperature=0 for greedy decoding
+          - seed from content hash for deterministic output
+          - cache_prompt=false to avoid KV cache nondeterminism
+        """
+        prompt = self._get_transformation_prompt(transformation_id)
+        if not prompt:
+            # Fallback: try ON API (non-deterministic)
+            return self.post(
+                "/transformations/execute",
+                data={
+                    "transformation_id": transformation_id,
+                    "input_text": input_text,
+                    "model_id": model_id,
+                },
+                timeout=600,
+            )
+
+        # Derive seed from input content (same input → same seed → same output)
+        content_hash = hashlib.sha256(input_text.encode()).hexdigest()
+        seed = int(content_hash[:8], 16)
+
+        # Construct messages: system prompt + user input
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": input_text},
+        ]
+
+        try:
+            resp = requests.post(
+                f"{LLM_URL}/v1/chat/completions",
+                json={
+                    "model": model_id,
+                    "messages": messages,
+                    "temperature": 0,
+                    "seed": seed,
+                    "max_tokens": 8192,
+                    "cache_prompt": False,
+                },
+                timeout=600,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            output = result["choices"][0]["message"].get("content", "")
+            return {"output": output}
+        except Exception as e:
+            raise RuntimeError(f"Deterministic LLM call failed: {e}") from e
 
     def models_list(self) -> list:
         return self.get("/models")
@@ -429,6 +486,21 @@ def build_dependency_graph(entries: list[dict]) -> dict:
 
 TRANSFORMATION_CONTEXT_COMPILER = "transformation:0tkrn2ru01xj0zd4cp09"
 TRANSFORMATION_CROSS_LAYER_LINKER = "transformation:j2puh5eolx32sc5b431s"
+
+# ---------------------------------------------------------------------------
+# Versioning scheme
+# ---------------------------------------------------------------------------
+# Increment CURRENT_VERSION when generation parameters (temperature, seed, model) change.
+# This preserves provenance: old cache entries keep their version number and params.
+CURRENT_VERSION = 1
+CURRENT_PARAMS = {
+    "temperature": 1.0,
+    "seed_mode": "random",
+    "model": "Qwen3.6-35B-A3B-Q4_K_M",
+    "transformation_id": TRANSFORMATION_CONTEXT_COMPILER,
+    "max_tokens": 8192,
+    "cache_prompt": True,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -680,11 +752,14 @@ def run_pipeline(
                     transformed += 1
                     print(f" {elapsed:.1f}s ({len(enriched_content)} chars)")
 
-                    # Update transform cache
+                    # Update transform cache (with versioning provenance)
                     cache.setdefault(rel, {})["transform_sha"] = sha[:16]
-                    # Store a preview of the transformed content (first 200 chars for cache validation)
                     cache[rel]["_transformed"] = True
                     cache[rel]["_transformed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    cache[rel]["transform_version"] = CURRENT_VERSION
+                    cache[rel]["transform_params"] = CURRENT_PARAMS.copy()
+                    cache[rel]["transform_output_sha"] = hashlib.sha256(enriched_content.encode()).hexdigest()[:16]
+                    cache[rel]["transform_versioned_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                     # Save cache periodically (every 5 successful transforms)
                     if transformed % 5 == 0:
                         save_cache_atomic(cache, cache_path)

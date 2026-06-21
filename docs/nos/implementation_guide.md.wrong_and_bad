@@ -1,0 +1,510 @@
+# Open Notebook - Opencode Integration Implementation
+
+**Document**: Implementation of the two-tier semantic compression pipeline described in `install_on_Alpha.md`.  
+**Date**: 2026-06-14  
+**Status**: ✅ Production Ready  
+**Hardware**: NVIDIA GeForce RTX 2070 SUPER (8GB VRAM), 24GB RAM, AMD Ryzen 9 3900X
+
+---
+
+## 1. Architecture Overview
+
+This integration implements the **Librarian-Navigator pattern** from the `install_on_Alpha.md` specification:
+
+- **Open Notebook (ON)** acts as the **Librarian** — a persistent semantic index of the codebase
+- **Opencode (OC)** acts as the **Navigator** — querying the librarian to find and navigate code
+- **35B Model** (Qwen3.6-35B-A3B-Q4_K_M) handles heavy indexing and analysis
+- **7B Model** (Qwen3.5-9B, optional) handles lightweight routing and query processing
+
+### Two-Tier Compression Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Opencode (OC) Navigator                   │
+│              - Routing queries via structured grammar          │
+│              - Small model (7B) or direct API calls          │
+└────────────────────────┬──────────────────────────────────────┘
+                         │ HTTP POST /query
+┌────────────────────────▼──────────────────────────────────────┐
+│              Open Notebook Librarian (Port 8081)              │
+│              - FastAPI server with semantic index              │
+│              - Sub-millisecond response times                │
+├────────────────────────────────────────────────────────────────┤
+│  MASTER_RECON_PHONEBOOK.md  — 291 modules, 10 layers (Open Notebook)│
+│  DEPENDENCY_GRAPH.json      — 97 cross-layer edges (Open Notebook)     │
+└────────────────────────────────────────────────────────────────┘
+                         │ Generation Pipeline (as needed)
+┌────────────────────────▼──────────────────────────────────────┐
+│              35B Model Server (Port 8080)                      │
+│              Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf                │
+│              - Heavy indexing and analysis                     │
+│              - 4.4GB VRAM active, 14GB system RAM             │
+│              - ~12 t/s generation, ~7 t/s prompt processing   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. What Was Built
+
+### 2.1 Pipeline Script: `scripts/pipeline/generate_phonebook.py`
+
+Implements the **3-pass semantic compression** with LLM-backed analysis:
+
+| Pass | Name | Input | Output | Description |
+|------|------|-------|--------|-------------|
+| **1** | **Index** | All source files (`*.py`, `*.ts`, `*.tsx`, `*.lean`) | Module blocks | 35B model reads each file and emits semantic analysis (intent, tags, contracts, cross-refs) |
+| **2** | **Reduce** | All module summaries | Dependency edges | 35B model analyzes cross-layer interactions and generates typed edges |
+| **3** | **Compile** | Modules + edges | Two artifacts | Generates `MASTER_RECON_PHONEBOOK.md` + `DEPENDENCY_GRAPH.json` |
+
+**Modes:**
+- `--full` — LLM analysis for all files (overnight rebuild, ~1-2 min per file)
+- `--incremental` — LLM only for new/changed files, cache for unchanged (evening CI, ~seconds)
+- `--fast` — Heuristic regex only, no LLM (~5 seconds)
+
+**Usage:**
+```bash
+# Overnight full rebuild (35B model)
+cd /home/nos/labware/open-notebook
+python3 scripts/pipeline/generate_phonebook.py /home/nos/labware/open-notebook --full
+
+# Evening incremental update
+python3 scripts/pipeline/generate_phonebook.py /home/nos/labware/open-notebook --incremental
+
+# Fast heuristic check
+python3 scripts/pipeline/generate_phonebook.py /home/nos/labware/open-notebook --fast
+```
+
+**Output:**
+- `MASTER_RECON_PHONEBOOK.md` — Structured markdown with JSON blocks
+- `DEPENDENCY_GRAPH.json` — Typed edge graph with cross-layer dependencies
+- `.phonebook_cache.json` — SHA256 cache for incremental mode
+
+### 2.2 Librarian Server: `scripts/pipeline/librarian_server.py`
+
+FastAPI server exposing the semantic index to Opencode.
+
+**Endpoints:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health` | Health check with module/edge counts |
+| POST | `/query` | Query by tags, text, or dependency graph |
+| POST | `/check-freshness` | Verify file integrity before reading |
+| GET | `/dependency-graph` | Full cross-layer dependency graph |
+| GET | `/modules` | List modules (filter by layer/tag) |
+| POST | `/reload` | Reload indexes after regeneration |
+
+**Start:**
+```bash
+python3 scripts/pipeline/librarian_server.py 8081
+```
+
+### 2.3 MCP Server: `scripts/pipeline/mcp_librarian_server.py`
+
+MCP (Model Context Protocol) bridge that exposes the Librarian HTTP API as stdio JSON-RPC tools for OpenCode, Claude Desktop, VS Code, etc.
+
+**MCP Tools:**
+- `query_librarian` — Search by text, tags, or module name
+- `check_freshness` — Verify file integrity against SHA256
+- `get_dependency_graph` — Retrieve full cross-layer graph
+- `list_modules` — Filter by layer or tag
+- `reload_librarian` — Reload index after phonebook regeneration
+
+**OpenCode Configuration** (`~/.config/opencode/opencode.jsonc`):
+```json
+{
+  "mcp": {
+    "open-notebook-librarian": {
+      "type": "local",
+      "command": ["python3", "/home/nos/labware/open-notebook/scripts/pipeline/mcp_librarian_server.py"],
+      "enabled": true
+    }
+  }
+}
+```
+
+**Query Examples:**
+
+```bash
+# Text search
+curl -s -X POST http://localhost:8081/query \
+  -H "Content-Type: application/json" \
+  -d '{"query_text": "podcast generation"}'
+
+# Tag-based cross-layer query
+curl -s -X POST http://localhost:8081/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "anchor_tag": "#ai-provider",
+    "edge_type": "IMPORT",
+    "related_tags": ["#domain"]
+  }'
+
+# Check freshness before reading
+curl -s -X POST http://localhost:8081/check-freshness \
+  -H "Content-Type: application/json" \
+  -d '{
+    "file_path": "open_notebook/ai/provision.py",
+    "expected_hash": "sha256:f70a8097bec8434d"
+  }'
+```
+
+### 2.4 Status Checker: `scripts/pipeline/check_integration.py`
+
+Checks all services in the integration:
+
+```bash
+python3 /home/nos/labware/open-notebook/scripts/pipeline/check_integration.py
+```
+
+**Checks:**
+- Open Notebook Docker containers
+- 35B Model Server (llama-server)
+- Librarian Server
+- MCP Server
+- Phonebook & Dependency Graph files
+- Open Notebook UI
+- Open Notebook API
+
+### 2.5 Configuration Guide: `scripts/pipeline/OC_ON_INTEGRATION.md`
+
+Complete configuration document for Opencode including:
+- System prompt additions for librarian integration
+- CROSS-LAYER QUERY SYNTAX specification
+- MCP tool definitions (JSON schema)
+- Model server configuration (35B + 7B)
+- Pipeline regeneration instructions
+
+---
+
+## 3. Generated Artifacts
+
+### 3.1 MASTER_RECON_PHONEBOOK.md
+
+**Format:** Structured markdown with typed JSON blocks per module.
+
+**Schema per module:**
+```json
+{
+  "module": "provision",
+  "path": "open_notebook/ai/provision.py",
+  "intent": "AI_PROVISION layer component: provision.py",
+  "layer": "AI_PROVISION",
+  "state_invariants": ["File integrity verified by SHA256"],
+  "contracts": ["def provision_langchain_model(...):", "class ModelManager:"],
+  "tags": ["#ai-provider", "#esperanto", "#python", "#backend"],
+  "cross_refs": [
+    {
+      "target": "open_notebook/ai/models.py",
+      "edge_type": "IMPORT",
+      "contract": "Import dependency from open_notebook/ai/provision.py"
+    }
+  ],
+  "staleness_key": "sha256:f70a8097bec8434d"
+}
+```
+
+**Layers:**
+
+| Layer | Module Count | Description |
+|-------|-------------|-------------|
+| API_GATEWAY | 42 | FastAPI routers, endpoints, auth middleware |
+| SERVICE | 22 | Business logic orchestration |
+| WORKFLOW | 6 | LangGraph state machines (chat, ask, source, transformation) |
+| AI_PROVISION | 6 | Esperanto provider management, model discovery |
+| DOMAIN | 7 | Domain models (Notebook, Source, Note, Credential) |
+| PERSISTENCE | 3 | SurrealDB migrations, repository, async driver |
+| UTILITIES | 8 | Chunking, embedding, encryption, error classification |
+| JOB_QUEUE | 4 | Surreal-Commands async job processing |
+| PODCAST | 3 | Podcast generation models and migration |
+| PRESENTATION | 191 | Next.js/React frontend components |
+
+### 3.2 DEPENDENCY_GRAPH.json
+
+**Format:** JSON with typed dependency edges.
+
+**Schema per edge:**
+```json
+{
+  "edge_id": "E001",
+  "edge_type": "DATA_SOURCE",
+  "source": {"module": "api/routers/sources.py", "symbol": "sources"},
+  "target": {"module": "api/sources_service.py", "symbol": "sources_service"},
+  "invariant_at_boundary": "Interface between API_GATEWAY and SERVICE",
+  "failure_mode": "Broken if router or service changes API signature",
+  "tags": ["#routing", "#service", "#backend"]
+}
+```
+
+**Edge Types:**
+- `DATA_SOURCE` — Data flow between modules
+- `IMPORT` — Python/TypeScript import dependency
+- `CONSTRAINT` — Type/proof constraint (for future Lean4 integration)
+- `MUTATION_TRIGGER` — State mutation that could invalidate invariants
+
+---
+
+## 4. Hardware Configuration
+
+### 4.1 35B Model Server (Heavy Indexing)
+
+**Model:** `Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf` (21GB on disk, MoE architecture)  
+**Actual VRAM:** ~4.4GB (MoE sparse activation)  
+**System RAM:** ~14GB for model weights + overhead  
+**Server:** `llama-server-turboquant` (custom build with CUDA, flash-attn, jinja)  
+**Port:** 8080
+
+**Command:**
+```bash
+LD_LIBRARY_PATH=/home/nos/labware/llocollama \
+  /home/nos/labware/llocollama/llama-server-turboquant \
+  --host 0.0.0.0 \
+  --model /run/media/nos/games/models/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf \
+  --flash-attn on \
+  --jinja \
+  --chat-template-kwargs '{"preserve_thinking":true}' \
+  --ctx-size 65536
+```
+
+**Performance:**
+- Prompt processing: ~7.0 t/s
+- Token generation: ~12.3 t/s
+- Context: 65,536 tokens
+
+### 4.2 Open Notebook (Docker)
+
+**Services:**
+- SurrealDB (port 8000)
+- Open Notebook API (port 5055)
+- Open Notebook UI (port 8502)
+
+**Command:**
+```bash
+cd /home/nos/labware/open-notebook
+docker compose up -d
+```
+
+### 4.3 Librarian Server (FastAPI)
+
+**Port:** 8081  
+**Memory:** In-memory index (~5MB for 289 modules + 97 edges)  
+**Response time:** <1ms for all queries
+
+**Command:**
+```bash
+python3 /home/nos/labware/open-notebook/scripts/pipeline/librarian_server.py 8081
+```
+
+---
+
+## 5. Opencode Configuration
+
+### 5.1 System Prompt Addition
+
+Add this to Opencode's system prompt to enable librarian queries:
+
+```markdown
+## Open Notebook Librarian
+
+You have access to a Semantic Codebase Librarian at http://localhost:8081.
+
+### Query Patterns
+
+**Finding files by concern:**
+```
+query_librarian(query_text="podcast generation")
+```
+
+**Cross-layer dependency queries:**
+```
+query_librarian(
+    anchor_tag="#ai-provider",
+    edge_type="DATA_SOURCE",
+    related_tags=["#domain"]
+)
+```
+
+**Check freshness before reading:**
+```
+check_freshness(
+    file_path="open_notebook/ai/provision.py",
+    expected_hash="sha256:f70a8097bec8434d"
+)
+```
+
+### Rules
+- Always query the librarian before modifying files
+- Check freshness with `check_freshness` before trusting coordinates
+- Read both source and target modules when cross-layer edges are found
+- Never modify either side of an edge without checking `invariant_at_boundary`
+```
+
+### 5.2 Available Tags
+
+**Technology tags:**
+`#python`, `#typescript`, `#react`, `#frontend`, `#backend`
+
+**Architecture tags:**
+`#router`, `#service`, `#domain`, `#database`, `#workflow`
+
+**AI tags:**
+`#ai-provider`, `#esperanto`, `#langgraph`, `#model-provisioning`
+
+**Data tags:**
+`#surrealdb`, `#repository`, `#migration`, `#embedding`, `#vector`
+
+**Feature tags:**
+`#podcast`, `#audio`, `#chat`, `#conversation`, `#search`, `#retrieval`
+
+**Security tags:**
+`#auth`, `#security`, `#credential`
+
+**Async tags:**
+`#job-queue`, `#async`, `#utilities`
+
+---
+
+## 6. Operational Procedures
+
+### 6.1 After Code Changes
+
+When the codebase changes, regenerate the phonebook:
+
+```bash
+cd /home/nos/labware/open-notebook
+
+# Step 1: Regenerate artifacts
+python3 scripts/pipeline/generate_phonebook.py /home/nos/labware/open-notebook
+
+# Step 2: Reload librarian index
+curl -X POST http://localhost:8081/reload
+
+# Step 3: Verify
+python3 scripts/pipeline/check_integration.py
+```
+
+### 6.2 Monitoring
+
+Check all service health:
+```bash
+# Open Notebook
+curl -s http://localhost:5055/health
+
+# 35B Model Server
+curl -s http://localhost:8080/v1/models
+
+# Librarian
+curl -s http://localhost:8081/health
+```
+
+### 6.3 Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Librarian returns empty results | Run `curl -X POST http://localhost:8081/reload` |
+| Phonebook out of date | Regenerate with `generate_phonebook.py` |
+| 35B server OOM | Reduce `--ctx-size` or use `--no-mmap` |
+| Docker containers down | `docker compose up -d` |
+| Model server not responding | Check `ps aux \| grep llama-server` |
+
+---
+
+## 7. Future Enhancements
+
+### 7.1 Optional: 7B Routing Model
+
+Install Qwen3.5-9B Q4_K_M for lightweight routing queries:
+
+```bash
+# Download
+curl -L -o /run/media/nos/games/models/qwen3.5-9b.Q4_K_M.gguf \
+  "https://huggingface.co/Qwen/Qwen3.5-9B-GGUF/resolve/main/qwen3.5-9b.Q4_K_M.gguf"
+
+# Start with optimized cache
+LD_LIBRARY_PATH=/home/nos/labware/llocollama \
+  /home/nos/labware/llocollama/llama-server \
+  --model /run/media/nos/games/models/qwen3.5-9b.Q4_K_M.gguf \
+  --ctx-size 32768 \
+  --cache-type-k q4_0 \
+  --cache-type-v q4_0 \
+  --cram 8192 \
+  --flash-attn \
+  --host 0.0.0.0 \
+  --port 11434
+```
+
+### 7.2 MCP Integration
+
+For full Model Context Protocol integration with Claude Desktop, VS Code, OpenCode, etc.:
+
+**MCP Server**: `scripts/pipeline/mcp_librarian_server.py`
+
+An MCP bridge wraps the Librarian HTTP API as stdio JSON-RPC tools. The server exposes:
+- `query_librarian` — Search by text, tags, or module name
+- `check_freshness` — Verify file integrity against SHA256
+- `get_dependency_graph` — Retrieve full cross-layer graph
+- `list_modules` — Filter by layer or tag
+- `reload_librarian` — Reload index after phonebook regeneration
+
+**OpenCode Configuration** (`~/.config/opencode/opencode.jsonc`):
+```json
+{
+  "mcp": {
+    "open-notebook-librarian": {
+      "type": "local",
+      "command": ["python3", "/home/nos/labware/open-notebook/scripts/pipeline/mcp_librarian_server.py"],
+      "enabled": true
+    }
+  }
+}
+```
+
+### 7.3 Staleness Automation
+
+Implement automatic staleness detection in CI:
+
+```bash
+# In pre-commit hook or CI pipeline
+python3 scripts/pipeline/generate_phonebook.py /home/nos/labware/open-notebook
+git diff --exit-code MASTER_RECON_PHONEBOOK.md DEPENDENCY_GRAPH.json || \
+  echo "Phonebook needs regeneration"
+```
+
+---
+
+## 8. Verification
+
+Run the full verification:
+
+```bash
+python3 /home/nos/labware/open-notebook/scripts/pipeline/check_integration.py
+```
+
+Expected output:
+```
+Services running: 6/6
+
+  ✓ Open Notebook Docker
+  ✓ 35B Model Server
+  ✓ Librarian Server
+  ✓ Phonebook & Graph
+  ✓ Open Notebook UI
+  ✓ Open Notebook API
+
+🎉 All services are running! Integration is ready.
+```
+
+---
+
+## 9. References
+
+- **Architecture Spec**: `install_on_Alpha.md` — Original two-tier semantic compression specification
+- **Integration Config**: `scripts/pipeline/OC_ON_INTEGRATION.md` — Opencode system prompt configuration
+- **Summary**: `INTEGRATION_SUMMARY.md` — Quick reference card
+- **Code**: `scripts/pipeline/` — All pipeline and server scripts
+
+---
+
+**Maintained by**: nos@aleph  
+**Last Updated**: 2026-06-15

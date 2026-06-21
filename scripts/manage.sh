@@ -493,22 +493,19 @@ case "${1:-help}" in
         ;;
     librarian)
         # Manage the librarian index server (FastAPI on :8081).
+        # Delegates to systemd --user for lifecycle management, providing
+        # automatic boot-time startup and consistent restart behavior.
         action="${2:-status}"
         shift 2 2>/dev/null || shift
         case "$action" in
             start)
-                if [ -f "$LIBRARIAN_PIDFILE" ] && kill -0 "$(cat "$LIBRARIAN_PIDFILE")" 2>/dev/null; then
-                    log "Librarian server already running (PID $(cat "$LIBRARIAN_PIDFILE"))"
+                if systemctl --user is-active open-notebook-librarian.service > /dev/null 2>&1; then
+                    log "Librarian server already running (systemd)"
                     exit 0
                 fi
                 [ -f "$LIBRARIAN_SCRIPT" ] || err "Librarian script not found: $LIBRARIAN_SCRIPT"
-                log "Starting librarian index server on :$LIBRARIAN_PORT..."
-                nohup python3 -m uvicorn librarian_server:app \
-                    --host 0.0.0.0 --port "$LIBRARIAN_PORT" \
-                    --app-dir "$PIPELINE_DIR" \
-                    --log-level info \
-                    > /tmp/lasercortex-librarian.log 2>&1 &
-                echo $! > "$LIBRARIAN_PIDFILE"
+                log "Starting librarian index server via systemd..."
+                systemctl --user start open-notebook-librarian.service 2>&1
                 # Wait for it to be ready
                 for i in $(seq 1 10); do
                     if curl -sf "http://localhost:$LIBRARIAN_PORT/modules" > /dev/null 2>&1; then
@@ -519,43 +516,29 @@ case "${1:-help}" in
                 done
                 ;;
             stop)
-                if [ -f "$LIBRARIAN_PIDFILE" ]; then
-                    PID=$(cat "$LIBRARIAN_PIDFILE")
-                    log "Stopping librarian server (PID $PID)..."
-                    kill "$PID" 2>/dev/null || true
-                    sleep 1
-                    kill -0 "$PID" 2>/dev/null && kill -9 "$PID" 2>/dev/null || true
-                    rm -f "$LIBRARIAN_PIDFILE"
+                if systemctl --user is-active open-notebook-librarian.service > /dev/null 2>&1; then
+                    log "Stopping librarian server (systemd)..."
+                    systemctl --user stop open-notebook-librarian.service 2>&1
                     log "Stopped"
                 else
-                    # Try to find and kill by port
-                    PID=$(lsof -ti :$LIBRARIAN_PORT 2>/dev/null || true)
-                    if [ -n "$PID" ]; then
-                        log "Stopping librarian server on port :$LIBRARIAN_PORT (PID $PID)..."
-                        kill "$PID" 2>/dev/null || true
-                        log "Stopped"
-                    else
-                        log "Librarian server not running"
-                    fi
+                    log "Librarian server not running"
                 fi
                 ;;
             status)
-                if [ -f "$LIBRARIAN_PIDFILE" ] && kill -0 "$(cat "$LIBRARIAN_PIDFILE")" 2>/dev/null; then
-                    echo "Running on :$LIBRARIAN_PORT (PID $(cat "$LIBRARIAN_PIDFILE"))"
-                elif lsof -ti :$LIBRARIAN_PORT > /dev/null 2>&1; then
-                    echo "Running on :$LIBRARIAN_PORT (PID $(lsof -ti :$LIBRARIAN_PORT))"
+                if systemctl --user is-active open-notebook-librarian.service > /dev/null 2>&1; then
+                    PID=$(systemctl --user show -p MainPID open-notebook-librarian.service 2>/dev/null | cut -d= -f2)
+                    echo "Running on :$LIBRARIAN_PORT via systemd (PID ${PID:-unknown})"
                 else
                     echo "Not running"
                 fi
                 ;;
             restart)
                 log "Restarting librarian server..."
-                "$0" librarian stop
-                sleep 1
-                "$0" librarian start
+                systemctl --user restart open-notebook-librarian.service 2>&1
                 ;;
             logs)
-                tail -30 /tmp/lasercortex-librarian.log 2>/dev/null || echo "No log file found"
+                journalctl --user -u open-notebook-librarian.service -n 30 --no-pager 2>/dev/null \
+                    || echo "No log entries found"
                 ;;
             *)
                 err "Usage: $0 librarian {start|stop|status|restart|logs}"
