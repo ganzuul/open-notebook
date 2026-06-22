@@ -492,14 +492,14 @@ TRANSFORMATION_CROSS_LAYER_LINKER = "transformation:j2puh5eolx32sc5b431s"
 # ---------------------------------------------------------------------------
 # Increment CURRENT_VERSION when generation parameters (temperature, seed, model) change.
 # This preserves provenance: old cache entries keep their version number and params.
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 CURRENT_PARAMS = {
-    "temperature": 1.0,
-    "seed_mode": "random",
+    "temperature": 0,
+    "seed_mode": "content_hash",
     "model": "Qwen3.6-35B-A3B-Q4_K_M",
     "transformation_id": TRANSFORMATION_CONTEXT_COMPILER,
     "max_tokens": 8192,
-    "cache_prompt": True,
+    "cache_prompt": False,
 }
 
 
@@ -714,18 +714,22 @@ def run_pipeline(
         transformed = 0
         skipped_transformed = 0
         for i, (fpath, content, analysis) in enumerate(ranked_files):
-            # Check if this file was already fully transformed (content hasn't changed)
+            # Check if this file was already fully transformed (content hasn't changed AND version matches)
             rel = str(fpath.relative_to(root))
             cached = cache.get(rel, {})
             sha = file_sha256(fpath)
-            if cached.get("transform_sha", "").endswith(sha[:16]):
-                # Already transformed in a previous run — restore from cache
+            cached_version = cached.get("transform_version", 0)
+            if cached_version == CURRENT_VERSION and cached.get("transform_sha", "").endswith(sha[:16]):
+                # Already transformed with current version — restore from cache
                 enriched_content = cached.get("_transformed_content", "")
                 if enriched_content:
                     enriched_entries[analysis["module"]] = enriched_content
                     skipped_transformed += 1
-                    print(f"  {analysis['module']} ({i+1}/{len(ranked_files)}) — cached ✓")
+                    print(f"  {analysis['module']} ({i+1}/{len(ranked_files)}) — cached (v{CURRENT_VERSION}) ✓")
                     continue
+                else:
+                    # Version matches but no cached content — re-transform
+                    pass
 
             t0 = time.time()
             print(f"  Transforming {analysis['module']} ({i+1}/{len(ranked_files)})...", end="", flush=True)
@@ -760,6 +764,8 @@ def run_pipeline(
                     cache[rel]["transform_params"] = CURRENT_PARAMS.copy()
                     cache[rel]["transform_output_sha"] = hashlib.sha256(enriched_content.encode()).hexdigest()[:16]
                     cache[rel]["transform_versioned_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    # Store full content for cache validation on subsequent runs
+                    cache[rel]["_transformed_content"] = enriched_content
                     # Save cache periodically (every 5 successful transforms)
                     if transformed % 5 == 0:
                         save_cache_atomic(cache, cache_path)
